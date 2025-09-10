@@ -15,6 +15,16 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+// Forward declare our custom pass factory function
+namespace mlir {
+// std::unique_ptr<mlir::Pass> createStencilOptimizePass();
+// std::unique_ptr<mlir::Pass> createPromoteStencilToSharedPass();
+// std::unique_ptr<mlir::Pass> createMaterializeSmemFromForceTagPass();
+std::unique_ptr<mlir::Pass> createSeqAlignDetectPass();
+std::unique_ptr<mlir::Pass> createPromoteSeqAlignToShared();
+std::unique_ptr<mlir::Pass> createMaterializeSWSmem(); 
+} // namespace mlir
+
 namespace py = pybind11;
 
 void init_triton_analysis(py::module &&m) {
@@ -92,6 +102,12 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUCoalesceAsyncCopy);
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",
                      createTritonInstrumentConcurrencySanitizer);
+  // ADD_PASS_WRAPPER_0("add_stencil_optimize", createStencilOptimizePass);
+  // ADD_PASS_WRAPPER_0("promote_stencil_to_shared", createPromoteStencilToSharedPass);
+  // ADD_PASS_WRAPPER_0("materialize_smem_from_force", createMaterializeSmemFromForceTagPass);
+  ADD_PASS_WRAPPER_0("add_seqalign_detect", createSeqAlignDetectPass);
+  ADD_PASS_WRAPPER_0("promote_seqalign_to_shared", createPromoteSeqAlignToShared);
+  ADD_PASS_WRAPPER_0("materialize_swsmem", createMaterializeSWSmem);
 }
 
 void init_triton_passes_convert(py::module &&m) {
