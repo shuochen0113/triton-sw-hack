@@ -251,6 +251,14 @@ class CUDABackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+
+        # ====================== [Custom Pass] ======================
+        passes.ttgpuir.add_seqalign_detect(pm)
+
+        # Notice: other custom passes should be added after the 2nd remove-layout-conversions pass
+        # to avoid removing our inserted
+        # ===========================================================
+        
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         if capability // 10 >= 8:
@@ -311,6 +319,20 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod)
+
+        # ====================== [Custom Pass] ======================
+        pm_post = ir.pass_manager(mod.context)
+        pm_post.enable_debug()
+        passes.ttgpuir.promote_seqalign_to_shared(pm_post)
+        passes.ttgpuir.materialize_swsmem(pm_post)
+            
+        # Optional
+        passes.common.add_canonicalizer(pm_post)
+        passes.common.add_cse(pm_post)
+
+        pm_post.run(mod)
+        # =========================================================
+
         metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
         tensordesc_meta = mod.get_tensordesc_metadata()
         metadata["tensordesc_meta"] = tensordesc_meta
