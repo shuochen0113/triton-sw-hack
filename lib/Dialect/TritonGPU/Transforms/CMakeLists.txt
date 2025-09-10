@@ -25,6 +25,11 @@ add_triton_library(TritonGPUTransforms
   Prefetch.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
+
+  SeqAlignDetectPass.cpp
+  PromoteSeqAlignToShared.cpp
+  MaterializeSWSmem.cpp
+  
   CoalesceAsyncCopy.cpp
   Utility.cpp
   WarpSpecialization/AutomaticWarpSpecialization.cpp
@@ -51,4 +56,5 @@ add_triton_library(TritonGPUTransforms
   TritonToTritonGPU
   TritonInstrumentIR
   MLIRTransformUtils
+  MLIRGPUDialect 
 )

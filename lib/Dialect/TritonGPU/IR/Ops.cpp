@@ -66,6 +66,14 @@ bool isConvertTrivial(ConvertLayoutOp op) {
       .succeeded();
 }
 
+static bool hasSmemForceAttr(Operation *op) {
+  return op && op->hasAttr("smem.force");
+}
+
+static bool hasSmemAnchorAttr(Operation *op) {
+  return op && op->hasAttr("smem.anchor");
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -81,6 +89,12 @@ struct CanonicalizeConvertFromReshape
   matchAndRewrite(triton::ReshapeOp op,
                   PatternRewriter &rewriter) const override {
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert)
       return failure();
     // If the layouts are structurally the same, the convert is trivial
@@ -125,6 +139,11 @@ struct CanonicalizeConvertFromTranspose
 
     // If the layouts are structurally the same, the convert is trivial
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert || !isConvertTrivial(convert))
       return failure();
 
@@ -179,6 +198,11 @@ struct CanonicalizeConvertFromGatherSource : public OpRewritePattern<GatherOp> {
       return failure();
 
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert)
       return failure();
 
@@ -199,6 +223,11 @@ struct CanonicalizeConvertFromAlloc
     if (!op.getSrc())
       return failure();
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert)
       return failure();
     rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
@@ -216,6 +245,11 @@ struct CanonicalizeConvertFromLocalStore
   matchAndRewrite(triton::gpu::LocalStoreOp op,
                   PatternRewriter &rewriter) const override {
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert)
       return failure();
     rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
@@ -232,6 +266,11 @@ struct CanonicalizeConvertFromSplit
   matchAndRewrite(triton::SplitOp op,
                   PatternRewriter &rewriter) const override {
     auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (convert && hasSmemForceAttr(convert))
+      return failure();
+    if (convert && hasSmemAnchorAttr(convert))
+      return failure();
+
     if (!convert)
       return failure();
     auto srcEncoding = convert.getSrc().getType().getEncoding();
@@ -253,6 +292,11 @@ struct CanonicalizeConvertFromConvert
   mlir::LogicalResult
   matchAndRewrite(ConvertLayoutOp op,
                   PatternRewriter &rewriter) const override {
+      if (hasSmemForceAttr(op))
+        return failure();
+      if (hasSmemAnchorAttr(op))
+        return failure();
+
     // Convert to the same layout is redundant.
     if (op->getResultTypes() == op->getOperandTypes()) {
       rewriter.replaceOp(op, op->getOperands());
@@ -1120,6 +1164,137 @@ std::pair<uint64_t, uint64_t> WarpSpecializeOp::getCaptureSizeAlign() {
 unsigned WarpSpecializeOp::getTotalPartitionWarps() {
   ArrayRef<int32_t> numWarps = getPartitionNumWarps();
   return std::accumulate(numWarps.begin(), numWarps.end(), 0);
+}
+
+//===----------------------------------------------------------------------===//
+// Ops for local_load_slice / local_store_slice
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+//
+// [Purpose]
+//   Provide explicit memory effects and robust verification for the new ops,
+//   ensuring that downstream lowering can rely on the (MemDesc, OffsetTensor)
+//   contract without guessing.
+//
+// [Design]
+//   - Effects: Read for load (from SMEM via MemDesc), Write for store.
+//   - Verifier: Enforce #triton_gpu.shared, mutability (for store), rank-1
+//               register tensors, shape equality between offset and data,
+//               and element type agreement with MemDesc.
+//   - Error messages are concise and actionable to aid IR debugging.
+//===----------------------------------------------------------------------===//
+
+void LocalLoadSliceOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects) {
+  // [Diagnostics]
+  // FINAL FIX #1: The signature MUST NOT have `const`, as proven by Ops.h.inc.
+  // FINAL FIX #2: The correct method to get the OpOperand is `getSrcMutable()`,
+  // as proven by Ops.h.inc. We take its address to get the required pointer.
+  //
+  // [Contract]
+  //   - Declares a Read effect on shared memory via the MemDesc operand.
+  effects.emplace_back(MemoryEffects::Read::get(), &getSrcMutable(),
+                       SharedMemory::get());
+}
+
+void LocalStoreSliceOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects) {
+  // [Diagnostics]
+  // FINAL FIX #1: The signature MUST NOT have `const`.
+  // FINAL FIX #2: The correct method is `getDstMutable()`.
+  //
+  // [Contract]
+  //   - Declares a Write effect on shared memory via the MemDesc operand.
+  effects.emplace_back(MemoryEffects::Write::get(), &getDstMutable(),
+                       SharedMemory::get());
+}
+
+// Verifier for LocalLoadSliceOp
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+// [Contract]
+//   - src: MemDescType in shared memory; rank-1; element type matches result.
+//   - offset/result: rank-1 register tensors with identical shapes.
+//   - MemDesc length >= result length.
+LogicalResult LocalLoadSliceOp::verify() {
+  Operation *op = getOperation();
+  auto mdTy = dyn_cast<MemDescType>(getSrc().getType());
+  auto offsetTy = dyn_cast<RankedTensorType>(getOffset().getType());
+  auto resultTy = dyn_cast<RankedTensorType>(getResult().getType());
+
+  if (!mdTy || !offsetTy || !resultTy) {
+    return op->emitOpError("operands and result must be valid descriptor and tensor types");
+  }
+  if (!isa<SharedMemorySpaceAttr>(mdTy.getMemorySpace())) {
+    return op->emitOpError("memory descriptor must be in shared memory space");
+  }
+  if (mdTy.getRank() != 1 || resultTy.getRank() != 1 || offsetTy.getRank() != 1) {
+    return op->emitOpError("memory descriptor, offset, and result tensors must all be rank-1");
+  }
+
+  // [Invariants] Offset and result represent per-thread registers: shapes identical.
+  if (resultTy.getShape() != offsetTy.getShape()) {
+    return op->emitOpError("shape mismatch between offset tensor and result tensor");
+  }
+  // [Safety] Ensure MemDesc is large enough for the logical access.
+  if (mdTy.getShape()[0] < resultTy.getShape()[0]) {
+    return op->emitOpError("memory descriptor shape must be >= result tensor shape");
+  }
+
+  // [Contract] Element type agreement between MemDesc and result.
+  if (mdTy.getElementType() != resultTy.getElementType()) {
+      return op->emitOpError("element type mismatch between memdesc and result tensor");
+  }
+  // [Contract] Offsets are integer-typed indices.
+  if (!isa<IntegerType>(offsetTy.getElementType())) {
+      return op->emitOpError("offset tensor must have an integer element type");
+  }
+
+  return success();
+}
+
+// Verifier for LocalStoreSliceOp 
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+// [Contract]
+//   - dst: MemDescType in shared memory; rank-1; mutable.
+//   - src/offset: rank-1 register tensors with identical shapes.
+//   - MemDesc length >= src length; element types between dst/src agree.
+LogicalResult LocalStoreSliceOp::verify() {
+  Operation *op = getOperation();
+  auto srcDataTy = dyn_cast<RankedTensorType>(getSrc().getType());
+  auto mdTy = dyn_cast<MemDescType>(getDst().getType());
+  auto offsetTy = dyn_cast<RankedTensorType>(getOffset().getType());
+
+  if (!mdTy || !srcDataTy || !offsetTy) {
+    return op->emitOpError("operands must be valid descriptor and tensor types");
+  }
+  if (!isa<SharedMemorySpaceAttr>(mdTy.getMemorySpace())) {
+    return op->emitOpError("memory descriptor must be in shared memory space");
+  }
+  if (!mdTy.getMutableMemory()) {
+    return op->emitOpError("cannot store to an immutable memory descriptor");
+  }
+  if (mdTy.getRank() != 1 || srcDataTy.getRank() != 1 || offsetTy.getRank() != 1) {
+    return op->emitOpError("memory descriptor, source, and offset tensors must all be rank-1");
+  }
+
+  // [Invariants] Source data and offset represent per-thread registers: shapes identical.
+  if (srcDataTy.getShape() != offsetTy.getShape()) {
+    return op->emitOpError("shape mismatch between source tensor and offset tensor");
+  }
+  // [Safety] Ensure MemDesc is large enough for the logical access.
+  if (mdTy.getShape()[0] < srcDataTy.getShape()[0]) {
+    return op->emitOpError("memory descriptor shape must be >= source tensor shape");
+  }
+
+  // [Contract] Element type agreement between MemDesc and source data.
+  if (mdTy.getElementType() != srcDataTy.getElementType()) {
+      return op->emitOpError("element type mismatch between memdesc and source tensor");
+  }
+  // [Contract] Offsets are integer-typed indices.
+  if (!isa<IntegerType>(offsetTy.getElementType())) {
+      return op->emitOpError("offset tensor must have an integer element type");
+  }
+
+  return success();
 }
 
 } // namespace mlir::triton::gpu

@@ -1568,6 +1568,145 @@ void SwizzledSharedEncodingAttr::print(AsmPrinter &printer) const {
 }
 
 //===----------------------------------------------------------------------===//
+// LinearSharedEncodingAttr (Custom)
+//
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+//   Printer/Parser/Verifier for a passive linear encoding attached to SMEM
+//   MemDesc. The encoding isolates our MemDesc from generic swizzling logic,
+//   enabling a deterministic lowering path for the SW kernel.
+//===----------------------------------------------------------------------===//
+
+//------------------------------------------------------------------------------
+// Printer
+//------------------------------------------------------------------------------
+static void printSharedEncoding(AsmPrinter &printer, ArrayRef<unsigned> order,
+                                CTALayoutAttr ctaLayout) {
+  // [Purpose] Emit a compact, explicit textual form:
+  //   #triton_gpu.linear_shared<{order = [d0, d1, ...], CTALayout = ...}>
+  printer << "<{";
+  printer << "order = [";
+  llvm::interleave(
+      order, printer, [&](unsigned i) { printer << i; }, ", ");
+  printer << "]";
+  printer << ", CTALayout = " << ctaLayout;
+  printer << "}>";
+}
+
+//------------------------------------------------------------------------------
+// Parser
+//------------------------------------------------------------------------------
+static LogicalResult parseSharedEncoding(AsmParser &parser,
+                                         ArrayRef<unsigned> &order,
+                                         CTALayoutAttr &ctaLayout) {
+  // [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+  // [Design] MLIR-style combinator parsing. Expected syntax:
+  //   "<{"
+  //     "order" "=" "[" <int (',' int)*> "]" ","
+  //     "CTALayout" "=" <ctalay_attr>
+  //   "}>"
+  SmallVector<unsigned> parsedOrder;
+
+  // "<{ order = ["
+  if (parser.parseLess() || parser.parseKeyword("order") || parser.parseEqual() ||
+      parser.parseLSquare())
+    return failure();
+
+  // "[" <int (',' int)*> "]"
+  do {
+    unsigned v = 0;
+    if (failed(parser.parseInteger(v)))
+      return failure();
+    parsedOrder.push_back(v);
+  } while (succeeded(parser.parseOptionalComma()));
+  if (parser.parseRSquare())
+    return failure();
+
+  // "," "CTALayout" "=" <attr>
+  if (parser.parseComma() || parser.parseKeyword("CTALayout") || parser.parseEqual())
+    return failure();
+  if (parser.parseAttribute(ctaLayout))
+    return failure();
+
+  // "}>"  (close the dict + type)
+  if (parser.parseRBrace() || parser.parseGreater())
+    return failure();
+
+  // [Contract] Provide a stable ArrayRef view; lifetime owned by parsedOrder.
+  order = ArrayRef<unsigned>(parsedOrder);
+  return success();
+
+  // ---------------------------------------------------------------------------
+  // NOTE(Reader):
+  // The remaining block is unreachable due to the early `return success();`
+  // above. It appears to be a legacy alternative parser path. We leave it here
+  // as a reminder of the intended logic, but it is *not executed*.
+  //
+  // FIXME(Shuochen-2025/09/10): Remove dead code or guard with `#if 0` to avoid
+  // confusion. Keeping code paths minimal reduces maintenance hazards.
+  // ---------------------------------------------------------------------------
+
+  // parse integer separated by commas
+  unsigned i;
+  while (parser.parseOptionalInteger(i).has_value()) {
+    parsedOrder.push_back(i);
+    if (parser.parseOptionalComma().failed())
+      break;
+  }
+
+  // parse CTALayout
+  if (parser.parseRSquare() || parser.parseComma() ||
+      parser.parseKeyword("CTALayout") || parser.parseEqual())
+    return failure();
+
+  if (parser.parseAttribute(ctaLayout))
+    return failure();
+
+  // transform std::vector to ArrayRef, then parse the last ">"
+  // NOTE: We need to manage the lifetime of parsedOrder ourselves,
+  // but it's safe in this simple case.
+  order = llvm::ArrayRef(parsedOrder);
+  return parser.parseGreater();
+}
+
+//------------------------------------------------------------------------------
+// Hook into Attr interface
+//------------------------------------------------------------------------------
+void LinearSharedEncodingAttr::print(AsmPrinter &printer) const {
+  // [Diagnostics] Single-source printing so textual IR stays consistent.
+  printSharedEncoding(printer, getOrder(), getCTALayout());
+}
+
+Attribute LinearSharedEncodingAttr::parse(AsmParser &parser, Type type) {
+  // [Contract] Delegate to the shared parser to ensure identical behavior
+  // across all places that need to parse this attribute.
+  ArrayRef<unsigned> order;
+  CTALayoutAttr ctaLayout;
+  if (failed(parseSharedEncoding(parser, order, ctaLayout)))
+    return {};
+  return get(parser.getContext(), order, ctaLayout);
+}
+
+//------------------------------------------------------------------------------
+// Verifier
+//------------------------------------------------------------------------------
+LogicalResult LinearSharedEncodingAttr::verify(
+    llvm::function_ref<InFlightDiagnostic()> emitError,
+    ArrayRef<unsigned> order, CTALayoutAttr ctaLayout) {
+  // [Contract] The logical rank implied by `order` must match the rank of
+  // the cooperative thread array (CTA) layout. This avoids malformed encodings
+  // that would confuse downstream layout or lowering logic.
+  if (order.size() != ctaLayout.getRank())
+    return emitError() << "order and ctaLayout must have the same rank";
+
+  // TODO(Shuochen-2025/09/10): Consider verifying:
+  //  - `order` is a permutation of [0..rank-1] with no duplicates.
+  //  - `ctaLayout` dims are positive and consistent with target tiling policy.
+  //  - Address space check (shared) if/when attr gains a direct link to MemDesc.
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // PaddedShared encoding
 //===----------------------------------------------------------------------===//
 

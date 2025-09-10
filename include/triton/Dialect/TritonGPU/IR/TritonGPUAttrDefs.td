@@ -1467,4 +1467,74 @@ def TTG_SharedMemorySpace : AttrDef<TritonGPU_Dialect, "SharedMemorySpace"> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Linear Shared Layout Encoding (Custom)
+//
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+//   A passive, linear encoding tag to isolate MemDesc in shared memory from
+//   generic swizzling/padding transforms in Triton. This is an *identity*
+//   marker only; it does not introduce any non-linear address arithmetic.
+//
+// [Purpose]
+//   - Provide a “Do-Not-Touch” signal to standard optimization/lowering passes.
+//   - Guarantee a purely linear (C-style) layout semantics for SMEM MemDesc.
+//   - Reserve a clean, interference-free surface for our dedicated lowering.
+//
+// [Design]
+//   - Carries only `order` (fastest→slowest logical dims) and `CTALayout`.
+//   - Intentionally omits any XOR/swizzle/padding-related parameters.
+//   - Works *only* as an encoding attached to SMEM MemDesc.
+//
+// [Contract]
+//   - Must be attached to MemDesc in #triton_gpu.shared address space.
+//   - Does not by itself change addresses; lowering must explicitly handle it.
+//   - Verified to ensure `order.size()` equals `CTALayout.rank()`.
+//
+// [Diagnostics]
+//   - Printed/parsed form: `#triton_gpu.linear_shared<{order=[...], CTALayout=...}>`
+//   - See Dialect.cpp for printer/parser implementation.
+//===----------------------------------------------------------------------===//
+
+def LinearSharedEncodingAttr
+    : TritonGPU_Attr<"LinearSharedEncoding", "linear_shared_encoding",
+                     // [Design] Share the same traits as other shared encodings,
+                     // but carry a linear-only intent.
+                     [SharedEncodingTrait, LayoutEncodingTrait]> {
+  let mnemonic = "linear_shared";
+
+  let description = [{
+    An encoding for tensors in shared memory that guarantees a purely linear,
+    C-style row-major or column-major layout. It performs no swizzling, XORing,
+    or any other non-linear address transformation, making it suitable for
+    algorithms that rely on direct pointer arithmetic (`base + offset`).
+
+    - `order`: Specifies the dimension order, from fastest-changing to slowest-changing.
+               For example, for a 2D shape [R, C], an order of [1, 0] corresponds
+               to a row-major layout where the C dimension is contiguous.
+    - `CTALayout`: Describes the distribution of the tensor across a group of CTAs.
+
+    [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+    [Contract] Must be used with MemDesc in #triton_gpu.shared; lowering is
+               expected to explicitly match `#ttg.linear_shared`.
+  }];
+
+  let parameters = (
+    ins
+    // [Contract] Order of logical tensor dimensions; fastest-varying first.
+    ArrayRefParameter<"unsigned">:$order,
+    // [Design] Standard CTA layout; rank must match `order.size()`.
+    "CTALayoutAttr":$CTALayout
+  );
+
+  // [Diagnostics] Use the same base class helpers as other encodings.
+  let extraClassDeclaration = extraBaseClassDeclaration;
+
+  // [Diagnostics] Provide custom printer/parser to ensure a compact, explicit
+  // textual form and robust error messages in Dialect.cpp.
+  let hasCustomAssemblyFormat = 1;
+
+  // [Contract] Verify (order rank == CTALayout rank), see `verify` impl.
+  let genVerifyDecl = 1;
+}
+
 #endif

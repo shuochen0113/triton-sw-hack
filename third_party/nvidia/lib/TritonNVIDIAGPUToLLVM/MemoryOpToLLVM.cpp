@@ -1,3 +1,13 @@
+//===----------------------------------------------------------------------===//
+// MemoryOpToLLVM.cpp (TritonNVIDIAGPUToLLVM)
+//
+// [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+//   No longer need custom hacking here
+//   Since we have defined our custom Op `ttg.local_load_slice` / `ttg.local_store_slice`
+//   They will be lowered to LLVM IR directly, carrying MemDesc + OffsetTensor
+//   without any high-level lowering optimization for NVIDIA backend.
+//===----------------------------------------------------------------------===//
+
 #include "Dialect/NVGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
@@ -11,6 +21,9 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
+// #include "triton/Dialect/Triton/IR/Dialect.h" // for recognize tt.view
+// #include "mlir/Dialect/LLVMIR/LLVMDialect.h"   // for recognize LLVM::ExtractValueOp
+
 namespace {
 
 using namespace mlir;
@@ -18,6 +31,46 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::NVIDIA;
 using namespace mlir::LLVM::NVIDIA;
+
+// =================================================================
+// Helper
+// =================================================================
+// static mlir::triton::gpu::LocalAllocOp findAllocFromMemDesc(mlir::Value memDesc) {
+//     // Use a set to prevent infinite loops in case of cycles in the IR
+//     llvm::SmallPtrSet<mlir::Value, 8> visited;
+
+//     while (memDesc) {
+//         if (!visited.insert(memDesc).second) {
+//             return nullptr;
+//         }
+
+//         mlir::Operation* definingOp = memDesc.getDefiningOp();
+//         if (!definingOp) {
+//             return nullptr;
+//         }
+
+//         // case1: Success. We found the root: LocalAllocOp.
+//         if (auto allocOp = llvm::dyn_cast<mlir::triton::gpu::LocalAllocOp>(definingOp)) {
+//             return allocOp;
+//         }
+        
+//         // case2: Trace back through MemDescIndexOp. the correct API is getSrc().
+//         if (auto indexOp = llvm::dyn_cast<mlir::triton::gpu::MemDescIndexOp>(definingOp)) {
+//             memDesc = indexOp.getSrc();
+//             continue;
+//         }
+        
+//         // case3: Trace back through LLVM struct passing of memdesc.
+//         // In LLVM dialect, the correct Op is ExtractValueOp, source is getContainer().
+//         if (auto extractOp = llvm::dyn_cast<mlir::LLVM::ExtractValueOp>(definingOp)) {
+//             memDesc = extractOp.getContainer();
+//             continue;
+//         }
+
+//         return nullptr;
+//     }
+//     return nullptr;
+// }
 
 LogicalResult lowerLdStMatrix(
     Location loc, const LinearLayout &regLayout, MemDescType memDescType,
@@ -81,6 +134,22 @@ public:
   LogicalResult
   matchAndRewrite(triton::gpu::LocalLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // =================================================================
+    // FIX
+    // =================================================================
+    // chech if the source of this Load is from our specially marked smem alloc.
+    // if so, this pattern actively declines to match (return failure),
+    // forcing MLIR to fall back to using a lower-priority, generic, linear Load Pattern.
+    // if (auto allocOp = findAllocFromMemDesc(op.getSrc())) {
+    //     if (allocOp->hasAttr("sw.smem.linear_layout")) {
+    //         return failure();
+    //     }
+    // }
+    // =================================================================
+    // FIX: END
+    // =================================================================
+
+
     if (!op.getSrc())
       return failure();
     MemDescType memDescType = op.getSrc().getType();
@@ -94,7 +163,7 @@ public:
     auto regLayout = toLinearLayout(dstTy);
     auto result =
         lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
-                        rewriter, targetInfo, getTypeConverter());
+                        rewriter, targetInfo, getTypeConverter()); // lower to 
     if (failed(result)) {
       return failure();
     }
@@ -161,6 +230,17 @@ struct LocalStoreOpConversion
   LogicalResult
   matchAndRewrite(triton::gpu::LocalStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // =================================================================
+    // FIX (Symmetric for Store)
+    // =================================================================
+    // if (auto allocOp = findAllocFromMemDesc(op.getDst())) {
+    //     if (allocOp->hasAttr("sw.smem.linear_layout")) {
+    //         return failure();
+    //     }
+    // }
+    // =================================================================
+    // FIX (Symmetric for Store): END
+    // =================================================================
     MemDescType memDescType = op.getDst().getType();
     RankedTensorType srcTy = op.getSrc().getType();
     Type llvmElemTy = typeConverter->convertType(srcTy.getElementType());

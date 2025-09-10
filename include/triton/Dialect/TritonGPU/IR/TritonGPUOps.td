@@ -576,4 +576,88 @@ def TTG_WarpReturnOp : TTG_Op<"warp_return", [
   let assemblyFormat = "attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+//  New Ops: local_load_slice / local_store_slice
+//  [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
+//
+//  These ops act as "information safes" in the middle-end: they preserve
+//  exactly two pieces of data required by lowering for SMEM access:
+//    (1) a MemDesc in #triton_gpu.shared carrying the linear_shared encoding;
+//    (2) a per-thread logical offset tensor (`offset`) that must pass through
+//        optimization without reconstruction or guessing.
+//
+//  [Purpose]
+//  - Provide deterministic, ambiguity-free handoff to the dedicated lowering.
+//  - Prohibit generic passes from rewriting address math for SW ring buffers.
+//  - Keep the textual IR concise and explicit via a custom assembly format.
+//
+//  [Contract]
+//  - `TTG_MemDescType` must be in #triton_gpu.shared and tagged appropriately.
+//  - `TT_Tensor` shapes: `result` (for load) or `src` (for store) must match
+//    the `offset` tensor shape exactly (1-D register tensors).
+//  - Element types between MemDesc and data tensor must match.
+//  - Verifiers enforce the shape/type/memory-space consistency.
+//
+//  [Diagnostics]
+//  - Assembly format prints: `src, offset : memdesc-type, tensor-type -> tensor`
+//  - Clear verifier messages on violations (rank/shape/type/addrspace).
+//
+//  [Lowering Hint]
+//  - Lowering will unpack the `offset` tensor into per-lane scalars, apply
+//    wrap/segment math, and emit straight GEP + ld/st in SMEM.
+//===----------------------------------------------------------------------===//
+
+def TTG_LocalLoadSliceOp : TTG_Op<"local_load_slice", [
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+  let summary = "Load a slice from a 1D shared memdesc using a dynamic offset tensor.";
+
+  let arguments = (ins
+    TTG_MemDescType:$src,
+    // [Contract] Per-thread logical offsets; must be a tensor type recognized
+    // by Triton front/mid-end (use TT_Tensor in TableGen, not C++ types).
+    // [Invariants] Rank-1 register tensor; shape must match `result`.
+    TT_Tensor:$offset
+  );
+  let results = (outs
+    // [Contract] The loaded data tensor; rank-1; element type must match memdesc.
+    // [Invariants] Shape must match `offset`.
+    TT_Tensor:$result
+  );
+
+  // [Diagnostics] Keep the textual IR readable and explicit.
+  let assemblyFormat = [{
+    $src `,` $offset attr-dict `:` qualified(type($src)) `,` type($offset) `->` type($result)
+  }];
+
+  // [Contract] Enforce shape/type/addrspace rules in the C++ verifier.
+  let hasVerifier = 1;
+}
+
+
+def TTG_LocalStoreSliceOp : TTG_Op<"local_store_slice", [
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+  let summary = "Store a slice to a 1D shared memdesc using a dynamic offset tensor.";
+
+  let arguments = (ins
+    // [Contract] Source data tensor; rank-1; element type matches memdesc.
+    // [Invariants] Shape must match `offset`.
+    TT_Tensor:$src,
+    // [Contract] Destination MemDesc in #triton_gpu.shared; must be mutable.
+    TTG_MemDescType:$dst,
+    // [Contract] Per-thread logical offsets; rank-1; shape matches `src`.
+    TT_Tensor:$offset
+  );
+  let results = (outs);
+
+  // [Diagnostics] Symmetric with load; keeps IR succinct.
+  let assemblyFormat = [{
+    $src `,` $dst `,` $offset attr-dict `:` type($src) `,` qualified(type($dst)) `,` type($offset)
+  }];
+
+  // [Contract] Enforce space/mutability/shape/type checks in the verifier.
+  let hasVerifier = 1;
+}
+
 #endif // TRITONGPU_OPS
