@@ -267,6 +267,14 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_plan_cta(pm, cluster_info)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+
+        # ====================== [Custom Pass] ======================
+        passes.ttgpuir.promote_seqalign_to_shared(pm)
+        passes.ttgpuir.materialize_swsmem(pm)
+        # Optional
+        passes.common.add_canonicalizer(pm)
+        # =========================================================
+
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
@@ -321,16 +329,16 @@ class CUDABackend(BaseBackend):
         pm.run(mod)
 
         # ====================== [Custom Pass] ======================
-        pm_post = ir.pass_manager(mod.context)
-        pm_post.enable_debug()
-        passes.ttgpuir.promote_seqalign_to_shared(pm_post)
-        passes.ttgpuir.materialize_swsmem(pm_post)
+        # pm_post = ir.pass_manager(mod.context)
+        # pm_post.enable_debug()
+        # passes.ttgpuir.promote_seqalign_to_shared(pm_post)
+        # passes.ttgpuir.materialize_swsmem(pm_post)
             
-        # Optional
-        passes.common.add_canonicalizer(pm_post)
-        passes.common.add_cse(pm_post)
+        # # Optional
+        # passes.common.add_canonicalizer(pm_post)
+        # passes.common.add_cse(pm_post)
 
-        pm_post.run(mod)
+        # pm_post.run(mod)
         # =========================================================
 
         metadata["cluster_dims"] = (cluster_info.clusterDimX, cluster_info.clusterDimY, cluster_info.clusterDimZ)
