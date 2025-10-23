@@ -423,6 +423,8 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+};
+
 class LocalBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
 public:
@@ -441,7 +443,6 @@ public:
     return success();
   }
 };
-
 } // namespace
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
@@ -458,5 +459,4 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
   patterns.add<LocalLoadSliceOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreSliceOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
-}
 }

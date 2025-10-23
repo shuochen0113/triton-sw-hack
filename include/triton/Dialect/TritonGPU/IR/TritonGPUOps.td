@@ -656,6 +656,7 @@ def TTG_LocalStoreSliceOp : TTG_Op<"local_store_slice", [
 
   // [Contract] Enforce space/mutability/shape/type checks in the verifier.
   let hasVerifier = 1;
+}
 
 def TTG_LocalBarrierOp : TTG_Op<"local_barrier"> {
   let summary = "Synchronizes execution and shared memory reads/writes for all threads in a CTA.";
