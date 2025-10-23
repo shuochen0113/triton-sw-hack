@@ -67,11 +67,11 @@ static void expandLoops(ModuleOp moduleOp) {
       if (isEpilogue) {
         // Return false for the predicate of the peeled iteration
         return rewriter.create<mlir::arith::ConstantIntOp>(
-            predOp.getLoc(), 0, predOp.getResult().getType());
+            predOp.getLoc(), predOp.getResult().getType(), 0);
       } else {
         if (predOp.getStage() == predOp.getMaxStage() - 1) {
           return rewriter.create<mlir::arith::ConstantIntOp>(
-              predOp.getLoc(), 1, predOp.getResult().getType());
+              predOp.getLoc(), predOp.getResult().getType(), 1);
         } else {
           OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPoint(op);
@@ -148,14 +148,6 @@ static void expandLoops(ModuleOp moduleOp) {
   resolveMaskOp(moduleOp, peeledMaskOps);
 }
 
-static void removeAttributes(ModuleOp moduleOp) {
-  moduleOp->walk([&](Operation *op) {
-    op->removeAttr(mlir::triton::kLoopStageAttrName);
-    op->removeAttr(mlir::triton::kLoopClusterAttrName);
-    op->removeAttr(mlir::triton::kScheduledMaxStageAttrName);
-  });
-}
-
 struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
 
   using impl::TritonGPUPipelineBase<PipelinePass>::TritonGPUPipelineBase;
@@ -180,7 +172,7 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     }
 
     // Cleanup the IR from the pipeline attributes.
-    removeAttributes(moduleOp);
+    removePipeliningAttributes(moduleOp);
 
     pipelineWgmma(moduleOp, numStages);
 

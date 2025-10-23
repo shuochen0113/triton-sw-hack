@@ -81,7 +81,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_accelerate_matmul", createTritonGPUAccelerateMatmul);
   ADD_PASS_WRAPPER_0("add_reorder_instructions",
                      createTritonGPUReorderInstructions);
-  ADD_PASS_WRAPPER_0("add_f32_dot_tc", createTritonGPUF32DotTC);
+  ADD_PASS_OPTION_WRAPPER_1("add_f32_dot_tc", createTritonGPUF32DotTC, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_optimize_dot_operands",
                             createTritonGPUOptimizeDotOperands, bool);
   ADD_PASS_WRAPPER_0("add_remove_layout_conversions",
@@ -108,6 +108,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_seqalign_detect", createSeqAlignDetectPass);
   ADD_PASS_WRAPPER_0("promote_seqalign_to_shared", createPromoteSeqAlignToShared);
   ADD_PASS_WRAPPER_0("materialize_swsmem", createMaterializeSWSmem);
+  ADD_PASS_WRAPPER_0("add_optimize_partition_warps",
+                     createTritonGPUOptimizePartitionWarps);
 }
 
 void init_triton_passes_convert(py::module &&m) {
@@ -122,6 +124,7 @@ void init_triton_passes_convert(py::module &&m) {
 void init_triton_passes_llvmir(py::module &&m) {
   using namespace mlir;
   ADD_PASS_WRAPPER_0("add_di_scope", mlir::createLLVMDIScope);
+  ADD_PASS_WRAPPER_0("add_di_local_variable", mlir::createLLVMDILocalVariable);
 }
 
 void init_gluon_passes(py::module &&m) {

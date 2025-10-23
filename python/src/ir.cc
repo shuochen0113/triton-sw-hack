@@ -9,6 +9,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -63,6 +64,23 @@ llvm::raw_ostream &mlir_dumps_or_dbgs() {
   }
 }
 
+// Function to parse a comma-separated string into a vector of C-style strings
+llvm::SmallVector<const char *, 3>
+parseCommaSeparatedValues(const std::string &input,
+                          llvm::SmallVector<std::string, 3> &storage) {
+  llvm::SmallVector<StringRef, 3> split;
+  llvm::SmallVector<const char *, 3> result;
+  StringRef(input.c_str()).split(split, ',');
+  llvm::transform(split, std::back_inserter(result), [&storage](StringRef str) {
+    // StringRefs are not always null-terminated.
+    // The purpose for this storage pattern is to
+    // produce a collection of C-strings that are.
+    storage.push_back(str.str());
+    return storage.back().c_str();
+  });
+  return result;
+}
+
 // Run the pass manager under a source manager diagnostic handler, which
 // enables emitted MLIR diagnostics to directly reference Python source
 // code. This diagnostic handler supports filtering diagnostic info by
@@ -99,29 +117,49 @@ struct TritonSourceMgrDiagnosticHandler : public SourceMgrDiagnosticHandler {
   llvm::SourceMgr sourceMgr;
 };
 
+TritonSourceMgrDiagnosticHandler
+setupTritonDiagnosticHandler(MLIRContext *context) {
+  bool showOperations = false, showStacktraces = false, showRemarks = false,
+       showWarnings = false;
+
+  if (auto enableDiagnostics =
+          triton::tools::getStrEnv("MLIR_ENABLE_DIAGNOSTICS");
+      !enableDiagnostics.empty()) {
+    llvm::SmallVector<std::string, 3> storage;
+    parseCommaSeparatedValues(enableDiagnostics, storage);
+    for (auto &str : storage) {
+      if (str == "warnings") {
+        showWarnings = true;
+      } else if (str == "remarks") {
+        showRemarks = true;
+      } else if (str == "stacktraces") {
+        showStacktraces = true;
+      } else if (str == "operations") {
+        showOperations = true;
+      }
+      // we show errors by default, so no need to set it
+    }
+  }
+
+  DiagnosticSeverity minSeverity =
+      showWarnings ? DiagnosticSeverity::Warning : DiagnosticSeverity::Error;
+  minSeverity = showRemarks ? DiagnosticSeverity::Remark : minSeverity;
+
+  context->printOpOnDiagnostic(showOperations);
+  context->printStackTraceOnDiagnostic(showStacktraces);
+  if (showStacktraces) {
+    context->disableMultithreading();
+  }
+
+  return TritonSourceMgrDiagnosticHandler(context, minSeverity);
+}
+
 std::string locationToString(Location loc) {
   std::string str;
   llvm::raw_string_ostream os(str);
   loc.print(os);
   os.flush(); // Make sure all the content is dumped into the 'str' string
   return str;
-}
-
-// Function to parse a comma-separated string into a vector of C-style strings
-llvm::SmallVector<const char *, 3>
-parseCommaSeparatedValues(const std::string &input,
-                          llvm::SmallVector<std::string, 3> &storage) {
-  llvm::SmallVector<StringRef, 3> split;
-  llvm::SmallVector<const char *, 3> result;
-  StringRef(input.c_str()).split(split, ',');
-  llvm::transform(split, std::back_inserter(result), [&storage](StringRef str) {
-    // StringRefs are not always null-terminated.
-    // The purpose for this storage pattern is to
-    // produce a collection of C-strings that are.
-    storage.push_back(str.str());
-    return storage.back().c_str();
-  });
-  return result;
 }
 
 void outputWarning(Location loc, const std::string &msg) {
@@ -270,6 +308,8 @@ void init_triton_ir(py::module &&m) {
       .value("TF32", InputPrecision::TF32)
       .value("TF32x3", InputPrecision::TF32x3)
       .value("IEEE", InputPrecision::IEEE)
+      .value("BF16x3", InputPrecision::BF16x3)
+      .value("BF16x6", InputPrecision::BF16x6)
       .export_values();
 
   py::enum_<ScaleDotElemType>(m, "ScaleDotElemTypeTY", py::module_local())
@@ -283,15 +323,14 @@ void init_triton_ir(py::module &&m) {
       .export_values();
 
   py::class_<MLIRContext>(m, "context", py::module_local())
-      .def(py::init<>())
+      .def(py::init<>([]() {
+        return std::make_unique<MLIRContext>(MLIRContext::Threading::DISABLED);
+      }))
       .def("printOpOnDiagnostic",
            [](MLIRContext &self, bool v) { self.printOpOnDiagnostic(v); })
-      .def("printStackTraceOnDiagnostic",
-           [](MLIRContext &self, bool v) {
-             self.printStackTraceOnDiagnostic(v);
-           })
-      .def("disable_multithreading",
-           [](MLIRContext &self) { self.disableMultithreading(); });
+      .def("printStackTraceOnDiagnostic", [](MLIRContext &self, bool v) {
+        self.printStackTraceOnDiagnostic(v);
+      });
 
   py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag",
                                          py::module_local())
@@ -341,11 +380,18 @@ void init_triton_ir(py::module &&m) {
       });
 
   py::class_<Location>(m, "location", py::module_local())
-      .def("__str__", [](Location &self) {
-        std::string str;
-        llvm::raw_string_ostream os(str);
-        self.print(os);
-        return os.str();
+      .def("__str__",
+           [](Location &self) {
+             std::string str;
+             llvm::raw_string_ostream os(str);
+             self.print(os);
+             return os.str();
+           })
+      .def("set_name", [](Location &self, std::string &name) {
+        mlir::StringAttr nameAttr =
+            mlir::StringAttr::get(self.getContext(), name);
+        mlir::NameLoc nameLoc = mlir::NameLoc::get(nameAttr, self);
+        self = dyn_cast<Location>(nameLoc);
       });
 
   py::class_<Value>(m, "value", py::module_local())
@@ -366,6 +412,8 @@ void init_triton_ir(py::module &&m) {
              }
            })
       .def("get_context", &Value::getContext)
+      .def("get_loc", &Value::getLoc)
+      .def("set_loc", &Value::setLoc)
       .def("replace_all_uses_with",
            [](Value &self, Value &newValue) {
              self.replaceAllUsesWith(newValue);
@@ -383,7 +431,9 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpResult, Value>(m, "op_result", py::module_local());
 
-  py::class_<BlockArgument, Value>(m, "block_argument", py::module_local());
+  py::class_<BlockArgument, Value>(m, "block_argument", py::module_local())
+      .def("get_loc", &BlockArgument::getLoc)
+      .def("set_loc", &BlockArgument::setLoc);
 
   py::class_<Region>(m, "region", py::module_local())
       .def("get_parent_region", &Region::getParentRegion, ret::reference)
@@ -407,6 +457,8 @@ void init_triton_ir(py::module &&m) {
              auto loc = UnknownLoc::get(ty.getContext());
              self.addArgument(ty, loc);
            })
+      .def("add_argument_at", [](Block &self, Type ty,
+                                 Location loc) { self.addArgument(ty, loc); })
       .def("get_num_arguments", &Block::getNumArguments)
       .def("get_argument", &Block::getArgument)
       .def("dump", &Block::dump)
@@ -516,6 +568,8 @@ void init_triton_ir(py::module &&m) {
            })
       .def("verify",
            [](OpState &self) -> bool {
+             TritonSourceMgrDiagnosticHandler handler =
+                 setupTritonDiagnosticHandler(self.getContext());
              return succeeded(verify(self.getOperation()));
            })
       .def("get_operation", [](OpState &self) { return self.getOperation(); });
@@ -772,58 +826,70 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, std::string value) -> Attribute {
              return self.getBuilder().getStringAttr(value);
            })
+      .def("get_disable_loop_licm_attr",
+           [](TritonOpBuilder &self) -> Attribute {
+             auto licmAttr =
+                 LLVM::LoopLICMAttr::get(self.getBuilder().getContext(),
+                                         self.getBuilder().getBoolAttr(true),
+                                         self.getBuilder().getBoolAttr(true));
+             mlir::LLVM::LoopAnnotationAttr la =
+                 mlir::LLVM::LoopAnnotationAttr::get(
+                     self.getBuilder().getContext(), {}, {}, {}, {}, {},
+                     licmAttr, {}, {}, {}, {}, {}, {}, {}, {}, {});
+             return la;
+           })
       // Use arith.ConstantOp to create constants
       // Constants
       .def("get_int1",
            [](TritonOpBuilder &self, bool v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI1Type()));
+                 self.getBuilder().getI1Type(), v));
            })
       .def("get_int8",
            [](TritonOpBuilder &self, int64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI8Type()));
+                 self.getBuilder().getI8Type(), v));
            })
       .def("get_int16",
            [](TritonOpBuilder &self, int64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI16Type()));
+                 self.getBuilder().getI16Type(), v));
            })
       .def("get_int32",
            [](TritonOpBuilder &self, int64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI32Type()));
+                 self.getBuilder().getI32Type(), v));
            })
       .def("get_int64",
            [](TritonOpBuilder &self, int64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI64Type()));
+                 self.getBuilder().getI64Type(), v));
            })
       .def("get_uint8",
            [](TritonOpBuilder &self, uint64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI8Type()));
+                 self.getBuilder().getI8Type(), v));
            })
       .def("get_uint16",
            [](TritonOpBuilder &self, uint64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI16Type()));
+                 self.getBuilder().getI16Type(), v));
            })
       .def("get_uint32",
            [](TritonOpBuilder &self, uint64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI32Type()));
+                 self.getBuilder().getI32Type(), v));
            })
       .def("get_uint64",
            [](TritonOpBuilder &self, uint64_t v) -> Value {
              return Value(self.create<arith::ConstantIntOp>(
-                 v, self.getBuilder().getI64Type()));
+                 self.getBuilder().getI64Type(), v));
            })
       .def("get_bf16",
            [](TritonOpBuilder &self, float v) -> Value {
              auto type = self.getBuilder().getBF16Type();
              return self.create<arith::ConstantFloatOp>(
-                 APFloat(type.getFloatSemantics(), std::to_string(v)), type);
+                 type, APFloat(type.getFloatSemantics(), std::to_string(v)));
            })
       .def("get_fp16",
            [](TritonOpBuilder &self, float v) -> Value {
@@ -844,9 +910,9 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Type type) -> Value {
              if (auto floatTy = dyn_cast<FloatType>(type))
                return self.create<arith::ConstantFloatOp>(
-                   APFloat(floatTy.getFloatSemantics(), 0), floatTy);
+                   floatTy, APFloat(floatTy.getFloatSemantics(), 0));
              else if (auto intTy = dyn_cast<IntegerType>(type))
-               return self.create<arith::ConstantIntOp>(0, intTy);
+               return self.create<arith::ConstantIntOp>(intTy, 0);
              else
                throw std::runtime_error("Not implemented");
            })
@@ -854,7 +920,7 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Type type) -> Value {
              uint64_t val = 0xFFFFFFFFFFFFFFFF;
              if (auto intTy = dyn_cast<IntegerType>(type))
-               return self.create<arith::ConstantIntOp>(val, intTy);
+               return self.create<arith::ConstantIntOp>(intTy, val);
              else
                throw std::runtime_error("Not implemented");
            })
@@ -1749,9 +1815,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
               std::vector<Value> &strides, std::vector<int32_t> &tensorShape,
-              bool isSignedInteger) -> Value {
+              bool isSignedInteger, PaddingOption paddingOption) -> Value {
              return self.create<MakeTensorDescOp>(base, shape, strides,
-                                                  tensorShape, isSignedInteger);
+                                                  tensorShape, isSignedInteger,
+                                                  paddingOption);
            });
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
@@ -1803,7 +1870,7 @@ void init_triton_ir(py::module &&m) {
            })
       .def(
           "run",
-          [](PassManager &self, ModuleOp &mod) {
+          [](PassManager &self, ModuleOp &mod, std::string repro_pipeline_tag) {
             // TODO: maybe dump module to file and print error for better
             // diagnostics
 
@@ -1814,6 +1881,11 @@ void init_triton_ir(py::module &&m) {
             auto reproducerPath =
                 triton::tools::getStrEnv("TRITON_REPRODUCER_PATH");
             if (!reproducerPath.empty()) {
+              if (reproducerPath != "-") {
+                std::string repro_suffix =
+                    "." + repro_pipeline_tag + ".repro.mlir";
+                reproducerPath += repro_suffix;
+              }
               auto anchorName = self.getOpAnchorName();
               auto passes = self.getPasses();
               Operation *op = mod.getOperation();
@@ -1849,47 +1921,92 @@ void init_triton_ir(py::module &&m) {
               self.enableTiming();
             }
 
-            // setting up diagnostics
-            bool showOperations = false, showStacktraces = false,
-                 showRemarks = false, showWarnings = false;
-
-            if (auto enableDiagnostics =
-                    triton::tools::getStrEnv("MLIR_ENABLE_DIAGNOSTICS");
-                !enableDiagnostics.empty()) {
-              llvm::SmallVector<std::string, 3> storage;
-              parseCommaSeparatedValues(enableDiagnostics, storage);
-              for (auto &str : storage) {
-                if (str == "warnings") {
-                  showWarnings = true;
-                } else if (str == "remarks") {
-                  showRemarks = true;
-                } else if (str == "stacktraces") {
-                  showStacktraces = true;
-                } else if (str == "operations") {
-                  showOperations = true;
-                }
-                // we show errors by default, so no need to set it
-              }
-            }
-
-            DiagnosticSeverity minSeverity = showWarnings
-                                                 ? DiagnosticSeverity::Warning
-                                                 : DiagnosticSeverity::Error;
-            minSeverity =
-                showRemarks ? DiagnosticSeverity::Remark : minSeverity;
-
-            TritonSourceMgrDiagnosticHandler diagHandler(context, minSeverity);
-
-            context->printOpOnDiagnostic(showOperations);
-            context->printStackTraceOnDiagnostic(showStacktraces);
-            if (showStacktraces) {
-              context->disableMultithreading();
-            }
+            TritonSourceMgrDiagnosticHandler diagHandler =
+                setupTritonDiagnosticHandler(context);
             if (failed(self.run(mod.getOperation())))
               throw std::runtime_error("PassManager::run failed");
           },
           py::call_guard<py::gil_scoped_release>());
 }
+
+bool str_eq_ignore_case(const char *s1, const char *s2, int n) {
+  for (int i = 0; i < n; ++i) {
+    if (tolower(s1[i]) != s2[i])
+      return false;
+  }
+  return true;
+}
+
+int strlen_max(const char *str, int max) {
+  for (int i = 0; i <= max; ++i) {
+    if (str[i] == '\0') {
+      return i;
+    }
+  }
+  return 0;
+}
+
+bool is_truthy(char *str) {
+  int len = strlen_max(str, 4);
+  switch (len) {
+  case 1:
+    return str[0] == '1' || tolower(str[0]) == 'y';
+  case 2:
+    return str_eq_ignore_case(str, "on", len);
+  case 3:
+    return str_eq_ignore_case(str, "yes", len);
+  case 4:
+    return str_eq_ignore_case(str, "true", len);
+  default:
+    return false;
+  }
+}
+
+PyObject *py_getenv(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
+  if (!(nargs == 1 || nargs == 2)) {
+    PyErr_SetString(PyExc_TypeError, "getenv expected 1 or 2 arguments");
+    return NULL;
+  }
+  PyObject *name = args[0];
+  PyObject *default_val = nargs == 2 ? args[1] : Py_None;
+  if (!PyUnicode_CheckExact(name)) {
+    PyErr_SetString(PyExc_TypeError, "name must be a string");
+    return NULL;
+  }
+  char *env_val = getenv(PyUnicode_AsUTF8(name));
+  if (!env_val) {
+    Py_INCREF(default_val);
+    return default_val;
+  }
+  return PyUnicode_FromString(env_val);
+}
+
+PyObject *py_getenv_bool(PyObject *self, PyObject *const *args,
+                         Py_ssize_t nargs) {
+  if (nargs != 2) {
+    PyErr_SetString(PyExc_TypeError, "getenv_bool expected 2 arguments");
+    return NULL;
+  }
+  PyObject *name = args[0];
+  PyObject *default_val = args[1];
+  if (!PyUnicode_CheckExact(name)) {
+    PyErr_SetString(PyExc_TypeError, "name must be a string");
+    return NULL;
+  }
+  char *env_val = getenv(PyUnicode_AsUTF8(name));
+  PyObject *res = default_val;
+  if (env_val) {
+    res = is_truthy(env_val) ? Py_True : Py_False;
+  }
+  Py_INCREF(res);
+  return res;
+}
+
+static PyMethodDef ModuleMethods[] = {
+    {"getenv", (PyCFunction)py_getenv, METH_FASTCALL, NULL},
+    {"getenv_bool", (PyCFunction)py_getenv_bool, METH_FASTCALL, NULL},
+    {NULL, NULL, 0, NULL} // sentinel
+};
 
 void init_triton_env_vars(py::module &m) {
   m.def("get_cache_invalidating_env_vars",
@@ -1907,4 +2024,5 @@ void init_triton_env_vars(py::module &m) {
           }
           return ret;
         });
+  PyModule_AddFunctions(m.ptr(), ModuleMethods);
 }

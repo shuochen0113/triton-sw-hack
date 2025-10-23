@@ -49,7 +49,7 @@ def TTG_AsyncWaitOp : TTG_Op<"async_wait"> {
 
   let results = (outs TTG_AsyncToken:$retToken);
 
-  let assemblyFormat = "$asyncToken attr-dict";
+  let assemblyFormat = "($asyncToken^)? attr-dict";
 
   let extraClassDeclaration = [{
     static bool isSupported(int computeCapability) {
@@ -64,7 +64,7 @@ def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
   let results = (outs TTG_AsyncToken:$asyncToken);
   let arguments = (ins Variadic<TTG_AsyncToken>:$inputTokens);
 
-  let assemblyFormat = [{($inputTokens ^)?attr-dict}];
+  let assemblyFormat = "(`tokens` $inputTokens^)? attr-dict";
 
   let extraClassDeclaration = [{
     static bool isSupported(int computeCapability) {
@@ -99,12 +99,6 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
     DefaultValuedAttr<BoolAttr, "false">:$isVolatile
   );
-
-  let builders = [
-      OpBuilder<(ins "Value":$src, "Value":$result,
-                     "triton::CacheModifier":$cache,
-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
-  ];
 
   let results = (outs TTG_AsyncToken:$token);
 
@@ -218,7 +212,7 @@ def TTG_MemDescIndexOp : TTG_Op<"memdesc_index", [Pure, MemDescViewTrait]> {
 
   let results = (outs TTG_MemDescType:$result);
 
-  let assemblyFormat = [{$src `,` $index attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
+  let assemblyFormat = [{$src `[` $index `]` attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
 
   let hasVerifier = 1;
 }
@@ -333,7 +327,6 @@ def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewT
     $src attr-dict `:` qualified(type($src)) `->` qualified(type($result))
   }];
 
-  let hasVerifier = 1;
   let hasFolder = 1;
 }
 
@@ -396,9 +389,6 @@ def TTG_MaskOp: TTG_Op<"mask",
     let arguments = (ins I1:$pred);
     let results = (outs Variadic<AnyType>:$result);
     let regions = (region SizedRegion<1>:$region);
-    let builders = [
-        OpBuilder<(ins "Value":$pred)>,
-    ];
 }
 
 def TTG_MaskReturnOp: TTG_Op<"mask.return",
@@ -428,6 +418,14 @@ def TTG_Fp4ToFpOp : TTG_Op<"fp4_to_fp", [Pure]> {
 
   let arguments = (ins RankedTensorOf<[I8]>:$src, I32Attr:$axis);
   let results = (outs TT_FloatTensor:$result);
+
+  let extraClassDeclaration = [{
+      static LogicalResult verifyFp4ToFp(
+        mlir::Operation *op,
+        RankedTensorType srcTy,
+        RankedTensorType resTy,
+        unsigned axis);
+  }];
 
   let assemblyFormat = [{
     $src attr-dict `:` type($src) `->` type($result)
@@ -658,6 +656,24 @@ def TTG_LocalStoreSliceOp : TTG_Op<"local_store_slice", [
 
   // [Contract] Enforce space/mutability/shape/type checks in the verifier.
   let hasVerifier = 1;
+
+def TTG_LocalBarrierOp : TTG_Op<"local_barrier"> {
+  let summary = "Synchronizes execution and shared memory reads/writes for all threads in a CTA.";
+  let description = [{
+    The `local_barrier` op synchronizes the execution and all operations
+    between shared memory and registers for all threads in a CTA.
+    It is used to coordinate communication between the threads of the CTA.
+
+    This operation waits until all threads in the CTA have reached a `local_barrier`
+    and operations between shared memory and registers made by these threads prior
+    to the op are visible to all threads in the CTA.
+
+    Data hazards between threads accessing the same memory can be avoided by synchronizing the
+    CTA in-between these accesses with a `local_barrier`.
+
+    A `local_barrier` operation does not provide syncronization guarantees on global memory.
+  }];
+  let assemblyFormat = "attr-dict";
 }
 
 #endif // TRITONGPU_OPS

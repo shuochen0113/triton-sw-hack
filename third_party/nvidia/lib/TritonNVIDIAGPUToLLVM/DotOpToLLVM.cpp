@@ -14,11 +14,36 @@ LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                          ConversionPatternRewriter &rewriter, bool isTuring,
                          bool isHopperF64);
 
+LogicalResult convertMMADotScaled(triton::DotScaledOp op,
+                                  triton::DotScaledOp::Adaptor adaptor,
+                                  const LLVMTypeConverter *typeConverter,
+                                  ConversionPatternRewriter &rewriter);
+
 LogicalResult convertWGMMA(triton::nvidia_gpu::WarpGroupDotOp op,
                            triton::nvidia_gpu::WarpGroupDotOp::Adaptor adaptor,
                            const LLVMTypeConverter *typeConverter,
                            ConversionPatternRewriter &rewriter, Value thread);
+
 namespace {
+struct ScaledDotOpConversion
+    : public ConvertOpToLLVMPattern<triton::DotScaledOp> {
+  using ConvertOpToLLVMPattern<triton::DotScaledOp>::ConvertOpToLLVMPattern;
+
+  ScaledDotOpConversion(LLVMTypeConverter &converter, int computeCapability,
+                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::DotScaledOp>(converter, benefit),
+        computeCapability(computeCapability) {}
+
+  LogicalResult
+  matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    return convertMMADotScaled(op, adaptor, getTypeConverter(), rewriter);
+  }
+
+private:
+  int computeCapability;
+};
+
 struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
   using ConvertOpToLLVMPattern<triton::DotOp>::ConvertOpToLLVMPattern;
 
@@ -108,31 +133,28 @@ struct WarpGroupDotWaitOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto pendings = op.getPendings();
     Location loc = op.getLoc();
-    if (adaptor.getInputs().size() <= 1) {
-      Value input =
-          adaptor.getInputs().size() == 1 ? adaptor.getInputs()[0] : Value();
-      rewriter.replaceOpWithNewOp<triton::nvgpu::WGMMAWaitGroupOp>(op, input,
-                                                                   pendings);
+    ValueRange inputs = adaptor.getInputs();
+    if (inputs.size() == 1) {
+      rewriter.replaceOpWithNewOp<triton::nvgpu::WGMMAWaitGroupOp>(
+          op, inputs.front(), pendings);
       return success();
     }
-    std::vector<Type> types;
+    SmallVector<Type> types;
     // Pack the inputs into a single struct.
-    for (Value input : adaptor.getInputs()) {
-      auto structType = dyn_cast<LLVM::LLVMStructType>(input.getType());
+    for (Type type : inputs.getTypes()) {
+      auto structType = dyn_cast<LLVM::LLVMStructType>(type);
       if (!structType)
         return failure();
-      for (Type type : structType.getBody())
-        types.push_back(type);
+      llvm::append_range(types, structType.getBody());
     }
     auto packedType =
         LLVM::LLVMStructType::getLiteral(rewriter.getContext(), types);
     Value packed = rewriter.create<LLVM::UndefOp>(loc, packedType);
     unsigned outputStructIndex = 0;
-    for (Value input : adaptor.getInputs()) {
-      auto structType = dyn_cast<LLVM::LLVMStructType>(input.getType());
-      for (unsigned i = 0; i < structType.getBody().size(); ++i) {
-        Value value = rewriter.create<LLVM::ExtractValueOp>(
-            loc, structType.getBody()[i], input, i);
+    for (Value input : inputs) {
+      for (auto [i, type] : llvm::enumerate(
+               cast<LLVM::LLVMStructType>(input.getType()).getBody())) {
+        Value value = rewriter.create<LLVM::ExtractValueOp>(loc, input, i);
         packed = rewriter.create<LLVM::InsertValueOp>(
             loc, packedType, packed, value, outputStructIndex++);
       }
@@ -142,14 +164,12 @@ struct WarpGroupDotWaitOpConversion
     // Unpack the output into the original struct types.
     SmallVector<Value> outputs;
     outputStructIndex = 0;
-    for (Value input : adaptor.getInputs()) {
-      auto structType = cast<LLVM::LLVMStructType>(input.getType());
+    for (Type type : inputs.getTypes()) {
+      auto structType = cast<LLVM::LLVMStructType>(type);
       Value unpacked = rewriter.create<LLVM::UndefOp>(loc, structType);
-      for (unsigned i = 0; i < structType.getBody().size(); ++i) {
+      for (auto [i, type] : llvm::enumerate(structType.getBody())) {
         Value value = rewriter.create<LLVM::ExtractValueOp>(
-            loc, packedType.getBody()[outputStructIndex], packedOutput,
-            outputStructIndex);
-        outputStructIndex++;
+            loc, packedOutput, outputStructIndex++);
         unpacked = rewriter.create<LLVM::InsertValueOp>(loc, structType,
                                                         unpacked, value, i);
       }
@@ -167,4 +187,6 @@ void mlir::triton::NVIDIA::populateDotOpToLLVMPatterns(
   patterns.add<DotOpConversion>(typeConverter, computeCapability, benefit);
   patterns.add<WarpGroupDotOpConversion>(typeConverter, benefit);
   patterns.add<WarpGroupDotWaitOpConversion>(typeConverter, benefit);
+  patterns.add<ScaledDotOpConversion>(typeConverter, computeCapability,
+                                      benefit);
 }

@@ -197,6 +197,7 @@ struct ConvertTritonGPUToLLVM
         id.replaceAllUsesWith(zero);
       });
     }
+    fixUpLoopAnnotation(mod);
 
     // Ensure warp group code is isolated from above.
     makeAllWarpGroupsIsolatedFromAbove(mod);
@@ -218,7 +219,7 @@ private:
         loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
         "global_smem", /*value=*/Attribute(), /*alignment=*/16,
         // Add ROCm support.
-        static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace));
+        static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
   }
 };
 

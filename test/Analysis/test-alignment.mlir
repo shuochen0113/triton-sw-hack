@@ -465,6 +465,22 @@ tt.func @max_min() {
 
 // -----
 
+// A complicated example with different contiguity and divisibility in lhs and rhs.
+// To simplify construction of the test we just pass attributes from the arguments
+tt.func @contiguity_dependent_divisibility(%arg0: tensor<8xi32> {tt.contiguity = 8 : i32, tt.divisibility = 4 : i32, tt.constancy = 1 : i32}, %arg1: tensor<8xi32> {tt.contiguity = 2 : i32, tt.divisibility = 8 : i32, tt.constancy = 1 : i32}) {
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %0 = arith.maxsi %arg0, %arg1 : tensor<8xi32>
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %1 = arith.minsi %arg0, %arg1 : tensor<8xi32>
+  // expected-remark @below {{contiguity = [1], divisibility = [4611686018427387904], constancy = [1], constant_value = 0}}
+  %2 = arith.constant 0 : i1
+  // expected-remark @below {{contiguity = [2], divisibility = [2], constancy = [1], constant_value = <none>}}
+  %3 = arith.select %2, %0, %1 : tensor<8xi32>
+  tt.return
+}
+
+// -----
+
 tt.func @if(%i1 : i1) {
   // expected-remark @below {{contiguity = [1, 1], divisibility = [64, 64], constancy = [128, 32], constant_value = 64}}
   %cst_64 = arith.constant dense<64> : tensor<128x32xi32>
@@ -842,7 +858,7 @@ tt.func @tensor_ptr(%arg0: !tt.ptr<tensor<64x16xi32>, 1>) {
 
 // -----
 
-tt.func public @chained_for(%8: tensor<128x64x!tt.ptr<bf16>> {tt.divisibility = 16 : i32}) {
+tt.func public @chained_for(%8: tensor<128x64x!tt.ptr<bf16>> {tt.divisibility = dense<[16, 16]> : tensor<2xi32>}) {
   // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
   %cst = arith.constant dense<0.000000e+00> : tensor<128x64xbf16>
   // expected-remark @below {{contiguity = [1], divisibility = [16], constancy = [1], constant_value = 16}}
@@ -897,5 +913,101 @@ tt.func @test_warp_specialize_propagation(%arg0: !tt.ptr<f16> {tt.divisibility =
     tt.addptr %arg2, %arg3 : !tt.ptr<f16>, i32
     ttg.warp_return
   } : (!tt.ptr<f16>, i32) -> ()
+  tt.return
+}
+
+// -----
+
+tt.func @if_into_for_init(%i1 : i1) {
+  %c0 = arith.constant 0 : i32
+  %cst_64 = arith.constant 64 : i32
+  %cst128 = arith.constant 128 : i32
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %ret = scf.if %i1 -> i32 {
+    scf.yield %cst_64 : i32
+  } else {
+    scf.yield %cst128 : i32
+  }
+  scf.for %i = %ret to %cst128 step %cst_64 : i32 {
+    // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [1], constant_value = <none>}}
+    %t = arith.addi %i, %c0 : i32
+  }
+  tt.return
+}
+
+// -----
+
+tt.func @if_into_for_step(%i1 : i1) {
+  %c0 = arith.constant 0 : i32
+  %cst_64 = arith.constant 64 : i32
+  %cst128 = arith.constant 128 : i32
+  // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [1], constant_value = <none>}}
+  %ret = scf.if %i1 -> i32 {
+    scf.yield %cst_64 : i32
+  } else {
+    scf.yield %cst128 : i32
+  }
+  scf.for %i = %c0 to %cst128 step %ret : i32 {
+    // expected-remark @below {{contiguity = [1], divisibility = [64], constancy = [1], constant_value = <none>}}
+    %t = arith.addi %i, %c0 : i32
+  }
+  tt.return
+}
+
+// -----
+
+tt.func @op_annotation(%i32 : i32) {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{contiguity = [1], divisibility = [4096], constancy = [1], constant_value = <none>}}
+  %ret0 = arith.addi %c0, %i32 { tt.divisibility = 4096 : i32 } : i32
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1024, 1024], constancy = [128, 64], constant_value = <none>}}
+  %ret1 = tt.splat %ret0 { tt.divisibility = dense<[1024, 1024]> : tensor<2xi32> } : i32 -> tensor<128x64xi32>
+  tt.return
+}
+
+// -----
+
+tt.func public @trans_4d_tensor_kernel(%arg0: tensor<32x32x32x32xi32> {tt.contiguity = dense<[32, 1, 1, 1]> : tensor<4xi32>, tt.divisibility = dense<[16, 1, 1, 1]> : tensor<4xi32>}) attributes {noinline = false} {
+  // expected-remark @below {{contiguity = [1, 1, 1, 32], divisibility = [1, 1, 1, 16], constancy = [1, 1, 1, 1], constant_value = <none>}}
+  %101 = tt.trans %arg0 {order = array<i32: 3, 2, 1, 0>} : tensor<32x32x32x32xi32> -> tensor<32x32x32x32xi32>
+  // expected-remark @below {{contiguity = [1, 32, 1, 1], divisibility = [1, 16, 1, 1], constancy = [1, 1, 1, 1], constant_value = <none>}}
+  %102 = tt.trans %arg0 {order = array<i32: 1, 0, 2, 3>} : tensor<32x32x32x32xi32> -> tensor<32x32x32x32xi32>
+  tt.return
+}
+
+// -----
+
+tt.func @unrealized_conversion_cast(%arg0: tensor<128x128xi32> {tt.contiguity = dense<[16, 32]> : tensor<2xi32>}) {
+  // Case 1: AxisInfo is propagated through a sequence of
+  // unrealized_conversion_cast ops.
+  // expected-remark @below {{contiguity = [16, 32], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %0 = builtin.unrealized_conversion_cast %arg0 : tensor<128x128xi32> to !llvm.struct<(i32, i32, i32, i32)>
+  // expected-remark @below {{contiguity = [16, 32], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %1 = builtin.unrealized_conversion_cast %0 : !llvm.struct<(i32, i32, i32, i32)> to tensor<128x128xi32>
+
+  // Case 2: AxisInfo is falling back to the pessimistic state if the
+  // propagated AxisInfo would be invalid.
+  // expected-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>}}
+  %2 = llvm.mlir.undef : !llvm.struct<(i32, i32, i32, i32)>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %3 = builtin.unrealized_conversion_cast %2 : !llvm.struct<(i32, i32, i32, i32)> to tensor<128x128xi32>
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %4 = tt.trans %3 {order = array<i32: 1, 0>} : tensor<128x128xi32> -> tensor<128x128xi32>
+  tt.return
+}
+
+// -----
+
+// Axis analysis does not support multi-dimensional function arguments. Make
+// sure that we don't crash.
+tt.func @callee(%arg0: tensor<128x1xi32>) {
+  tt.return
+}
+
+tt.func @caller() {
+  %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32>
+  // expected-remark @below {{contiguity = [128, 1], divisibility = [1073741824, 1], constancy = [1, 1], constant_value = <none>}}
+  %1 = tt.expand_dims %0 {axis = 1: i32} : tensor<128xi32> -> tensor<128x1xi32>
+  tt.call @callee(%1) : (tensor<128x1xi32>) -> ()
   tt.return
 }

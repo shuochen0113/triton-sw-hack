@@ -1,10 +1,12 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LayoutUtility.h"
 
 namespace {
 
@@ -26,19 +28,20 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   auto kWarp = str_attr("warp");
   auto kOffset = str_attr("offset");
   auto regLayout = toLinearLayout(regTy);
-  auto paddedLayout =
+  auto paddedEnc =
       dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(memDescTy.getEncoding());
   LinearLayout cvt = LinearLayout::empty();
-  if (paddedLayout) {
-    cvt = regLayout.reshapeOuts({{kOffset, regLayout.getTotalOutDimSize()}});
+  if (paddedEnc) {
+    const auto &sharedLL = paddedEnc.getLinearComponent();
+    cvt = regLayout.invertAndCompose(sharedLL);
   } else {
     auto sharedLayout = toLinearLayout(memDescTy);
     cvt = regLayout.invertAndCompose(sharedLayout);
-    auto kBlock = str_attr("block");
-    // NYI. We would need to emit a map.shared::cluster instruction.
-    if (!cvt.isTrivialOver({kBlock})) {
-      return failure();
-    }
+  }
+  auto kBlock = str_attr("block");
+  // NYI. We would need to emit a map.shared::cluster instruction.
+  if (!cvt.isTrivialOver({kBlock})) {
+    return failure();
   }
   cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
@@ -163,19 +166,19 @@ public:
     auto kWarp = str_attr("warp");
     auto kOffset = str_attr("offset");
     auto regLayout = toLinearLayout(regTy);
-    auto paddedLayout =
-        dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
+    auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(sharedEnc);
     LinearLayout cvt = LinearLayout::empty();
-    if (paddedLayout) {
-      cvt = regLayout.reshapeOuts({{kOffset, regLayout.getTotalOutDimSize()}});
+    if (paddedEnc) {
+      const auto &sharedLL = paddedEnc.getLinearComponent();
+      cvt = regLayout.invertAndCompose(sharedLL);
     } else {
       auto sharedLayout = toLinearLayout(memDescTy);
       cvt = regLayout.invertAndCompose(sharedLayout);
-      auto kBlock = str_attr("block");
-      // NYI. We would need to emit a map.shared::cluster instruction.
-      if (!cvt.isTrivialOver({kBlock})) {
-        return failure();
-      }
+    }
+    auto kBlock = str_attr("block");
+    // NYI. We would need to emit a map.shared::cluster instruction.
+    if (!cvt.isTrivialOver({kBlock})) {
+      return failure();
     }
     cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
 
@@ -420,6 +423,23 @@ public:
 
 private:
   const TargetInfoBase &targetInfo;
+class LocalBarrierOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp> {
+public:
+  LocalBarrierOpConversion(const LLVMTypeConverter &converter,
+                           PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::gpu::LocalBarrierOp>(converter,
+                                                            benefit) {}
+  using OpAdaptor = typename triton::gpu::LocalBarrierOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::LocalBarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    rewriter.replaceOpWithNewOp<mlir::gpu::BarrierOp>(op);
+
+    return success();
+  }
 };
 
 } // namespace
@@ -437,4 +457,6 @@ void mlir::triton::populateMemoryOpToLLVMPatterns(
   // [MODIFIED] Register our new patterns
   patterns.add<LocalLoadSliceOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreSliceOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
+}
 }

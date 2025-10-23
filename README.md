@@ -1,8 +1,6 @@
 # SW Kernel - Compiler Extensions for Triton (Shared Memory Materialization)
 **Shuochen’s hack for `sw_kernel` v1 - 2025/09/10**
 
-This repository documents a vertical compiler bypass that makes Triton generate *deterministic, shared-memory* code for Smith–Waterman dynamic programming. We introduce a linear shared-memory encoding, new middle-end ops that preserve addressing information, a traffic-materializing pass, and targeted lowering. The result is functional parity with our reference (“gold”) implementation and a substantial speedup over Triton’s baseline.
-
 ---
 
 ## Why a Bypass Is Necessary

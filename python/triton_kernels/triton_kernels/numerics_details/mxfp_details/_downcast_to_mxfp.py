@@ -19,6 +19,15 @@ def _get_max_quant_val(dtype: tl.constexpr):
         tl.static_assert(False, f"Invalid {dtype=}")
 
 @triton.jit
+def _get_max_power_of_2_quant_val(dtype: tl.constexpr):
+    if dtype == tl.uint8:
+        return 4.0
+    elif dtype == tl.float8e5:
+        return 32768.0
+    elif dtype == tl.float8e4nv:
+        return 256.0
+
+@triton.jit
 def _compute_quant_and_scale(src_tensor, valid_src_mask, mx_tensor_dtype: tl.constexpr,
                              DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr = 0):
     is_fp8: tl.constexpr = mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
@@ -32,18 +41,19 @@ def _compute_quant_and_scale(src_tensor, valid_src_mask, mx_tensor_dtype: tl.con
     abs_tensor = tl.where(valid_src_mask, abs_tensor, -1.0)  # Don't consider padding tensors in scale computation
     abs_tensor = tl.reshape(abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, MXFP_BLOCK_SIZE])
     max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
-    dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
     if DEQUANT_SCALE_ROUNDING_MODE == 0:
         # DequantScaleRoundingMode.ROUND_UP
         # compute 2 ** ceil(log2(dequant_scale))
         # Adding 0x007FFFFF adds exponent by 1 unless mantissa is all zeros
         # A corner case: exponent is 0xFF that will overflow but that's already
         # NaN so assume we don't care.
+        dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
         dequant_scale_exponent = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
     else:
         # DequantScaleRoundingMode.ROUND_DOWN
         # compute 2 ** floor(log2(dequant_scale))
         assert DEQUANT_SCALE_ROUNDING_MODE == 1
+        dequant_scale = max_val / _get_max_power_of_2_quant_val(mx_tensor_dtype)
         dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
     dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
     quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
@@ -68,7 +78,7 @@ def _compute_quant_and_scale(src_tensor, valid_src_mask, mx_tensor_dtype: tl.con
         exponents = (quant_tensor >> 23) & 0xFF
         mantissas = (quant_tensor & 0x7FFFFF)
 
-        # 0.25 <= x < 0.75 maps to 0.5, a denormal number
+        # For RTNE: 0.25 < x < 0.75 maps to 0.5 (denormal); exactly 0.25 maps to 0.0
         E8_BIAS = 127
         E2_BIAS = 1
         # Move implicit bit 1 at the beginning to mantissa for denormals
@@ -79,8 +89,13 @@ def _compute_quant_and_scale(src_tensor, valid_src_mask, mx_tensor_dtype: tl.con
         exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
 
         # Combine sign, exponent, and mantissa, while saturating
-        # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-        e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
+        # Round to nearest, ties to even (RTNE): use guard/sticky and LSB to decide increment
+        m2bits = mantissas >> 21
+        lsb_keep = (m2bits >> 1) & 0x1
+        guard = m2bits & 0x1
+        sticky = ((mantissas & 0x1FFFFF) != 0).to(tl.uint32)
+        round_inc = guard & (sticky | lsb_keep)
+        e2m1_tmp = tl.minimum((((exponents << 2) | m2bits) + round_inc) >> 1, 0x7)
         e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
 
         e2m1_value = tl.reshape(e2m1_value, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM // 2, 2])
@@ -107,7 +122,7 @@ def _downcast_to_mxfp(mx_tensor_ptr, stride_mxt_outer, stride_mxt_quant: tl.cons
 
     src_dtype: tl.constexpr = src_ptr.dtype.element_ty
     tl.static_assert(mx_scale_ptr.dtype.element_ty == tl.uint8, f"{mx_scale_ptr.dtype.element_ty=} must be uint8")
-    tl.static_assert((src_dtype == tl.bfloat16) or (src_dtype == tl.float16), f"{src_dtype=} must be bfloat16 or float16")
+    tl.static_assert((src_dtype == tl.bfloat16) or (src_dtype == tl.float16) or (src_dtype == tl.float32), f"{src_dtype=} must be bfloat16 or float16 or float32")
     is_fp4: tl.constexpr = mx_tensor_dtype == tl.uint8
 
     outer_block = tl.program_id(0).to(tl.int64)
@@ -154,5 +169,5 @@ def _downcast_to_mxfp(mx_tensor_ptr, stride_mxt_outer, stride_mxt_quant: tl.cons
 
 
 @triton.jit(repr=lambda _: "_dequantize_mxfp8")
-def _dequantize_mxfp8_fn(input, mask, pid=None):
+def _quantize_mxfp8_fn(input, mask, pid=None):
     return _compute_quant_and_scale(input, mask, tl.float8e4nv)

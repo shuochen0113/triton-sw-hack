@@ -80,6 +80,31 @@ static bool hasSmemAnchorAttr(Operation *op) {
 // Canonicalizer
 //===----------------------------------------------------------------------===//
 
+// tmem_store(cvt) -> tmem_store
+struct CanonicalizeConvertFromTMEMStore
+    : public mlir::OpRewritePattern<nvidia_gpu::TMEMStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(nvidia_gpu::TMEMStoreOp op,
+                  PatternRewriter &rewriter) const override {
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+
+    // bail for incompatible layouts
+    auto cvtSrcType = convert.getSrc().getType();
+    if (!nvidia_gpu::isDistributedLayoutTMemCompatible(
+            op.getOperation(), cvtSrcType, op.getDst().getType())) {
+      return failure();
+    }
+
+    rewriter.modifyOpInPlace(
+        op, [&]() { op.getSrcMutable().assign(convert.getSrc()); });
+    return mlir::success();
+  }
+};
+
 // reshape(cvt) -> reshape
 struct CanonicalizeConvertFromReshape
     : public mlir::OpRewritePattern<triton::ReshapeOp> {
@@ -415,43 +440,83 @@ void ConvertLayoutOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
   patterns.add<CanonicalizeConvertFromAlloc>(context);
   patterns.add<CanonicalizeConvertFromLocalStore>(context);
   patterns.add<CanonicalizeConvertFromSplit>(context);
+  patterns.add<CanonicalizeConvertFromTMEMStore>(context);
 }
 
 LogicalResult Fp4ToFpOp::verify() {
   auto srcTy = cast<RankedTensorType>(getSrc().getType());
   auto resTy = cast<RankedTensorType>(getResult().getType());
-  auto rank = srcTy.getRank();
-
-  if (rank != resTy.getRank())
-    return emitError() << "source rank " << rank << " != result rank "
-                       << resTy.getRank();
-
-  auto srcShape = srcTy.getShape();
-  auto resShape = resTy.getShape();
   auto axis = getAxis();
-
-  if (!(0 <= axis && axis < rank))
-    return emitError() << "axis " << axis << " out of range for rank " << rank;
 
   auto elemType = resTy.getElementType();
   if (!(elemType.isBF16() || elemType.isF16()))
     return emitError() << "only bf16 or f16 is supported for now, got "
                        << elemType;
 
+  return verifyFp4ToFp(*this, srcTy, resTy, axis);
+}
+
+LogicalResult Fp4ToFpOp::verifyFp4ToFp(mlir::Operation *op,
+                                       RankedTensorType srcTy,
+                                       RankedTensorType resTy, unsigned axis) {
+  auto rank = srcTy.getRank();
+
+  if (rank != resTy.getRank())
+    return op->emitError() << "source rank " << rank << " != result rank "
+                           << resTy.getRank();
+
+  auto srcShape = srcTy.getShape();
+  auto resShape = resTy.getShape();
+
+  if (!(0 <= axis && axis < rank))
+    return op->emitError() << "axis " << axis << " out of range for rank "
+                           << rank;
+
   for (int i = 0; i < rank; ++i) {
     if (i == axis) {
       if (resShape[i] != srcShape[i] * 2)
-        return emitError() << "axis " << axis
-                           << " dimension must be 2x source dimension (src="
-                           << srcShape[i] << ", dst=" << resShape[i] << ")";
+        return op->emitError()
+               << "axis " << axis
+               << " dimension must be 2x source dimension (src=" << srcShape[i]
+               << ", dst=" << resShape[i] << ")";
     } else {
       if (resShape[i] != srcShape[i])
-        return emitError() << "dimension " << i
-                           << " mismatch (src=" << srcShape[i]
-                           << ", dst=" << resShape[i] << ", axis=" << axis
-                           << ")";
+        return op->emitError()
+               << "dimension " << i << " mismatch (src=" << srcShape[i]
+               << ", dst=" << resShape[i] << ", axis=" << axis << ")";
     }
   }
+  if (bool(resTy.getEncoding()) != bool(srcTy.getEncoding()))
+    return op->emitError()
+           << "source and result must both have an encoding, or neither";
+  if (!resTy.getEncoding()) {
+    return success();
+  }
+  auto srcLl = toLinearLayout(srcTy);
+  auto resLl = toLinearLayout(resTy);
+  auto *ctx = srcTy.getContext();
+  auto regDim = StringAttr::get(ctx, "register");
+  auto outDims = standardOutDimNames(ctx, rank);
+
+  // We use backward inference here as it is striclty more general
+  Attribute inferSrc;
+  auto dialect =
+      resTy.getEncoding()
+          .getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+  assert(dialect);
+  if (failed(dialect->inferFp4ToFpOpEncoding(
+          resTy.getShape(), axis, resTy.getEncoding(), inferSrc,
+          /*fwdInference*/ false, std::nullopt))) {
+    return op->emitError() << "failed to infer encoding";
+  }
+  if (!areLayoutsEquivalent(srcTy.getShape(),
+                            cast<LayoutEncodingTrait>(inferSrc),
+                            cast<LayoutEncodingTrait>(srcTy.getEncoding())))
+    return op->emitError()
+           << "Src and Dst encodings are not compatible:\n"
+           << toLinearLayout(srcTy.getShape(), inferSrc).toString() << "\n"
+           << srcLl.toString();
   return success();
 }
 
@@ -549,55 +614,51 @@ LogicalResult MemDescReshapeOp::verify() {
   if (failed(inferReturnTypes(getContext(), getLoc(), srcType,
                               dstType.getShape(), expectedTy)))
     return failure();
-  // Check that the alloc shape separately to give a cleaner error, given that
-  // it's the most likely source of the error.
-  if (expectedTy.getAllocShape() != dstType.getAllocShape()) {
-    return emitError(
-        "The result alloc shape does not match the expected alloc shape.");
-  }
-  if (expectedTy != dstType) {
-    return emitError("source and destination layout are incompatible.");
-  }
-  return success();
+  return OpTrait::impl::verifyEquivalentType(expectedTy, dstType);
 }
 
 static LogicalResult inferMemDescReshapeOpEncoding(ArrayRef<int64_t> srcShape,
                                                    Attribute srcEnc,
                                                    ArrayRef<int64_t> dstShape,
                                                    Attribute &dstEnc) {
+  // TODO Delete this once SharedLinearEncodingAttr is more widely supported.
   if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(srcEnc)) {
-    // TODO: supporting reshape of CTA layouts is non-trivial.
-    if (getNumCTAs(mmaEncoding) > 1)
-      return failure();
-    int innerDimDst =
-        mmaEncoding.getTransposed() ? dstShape.front() : dstShape.back();
-    int innerDimSrc =
-        mmaEncoding.getTransposed() ? srcShape.front() : srcShape.back();
-    // For now disallow reshape of the inner dimension.
-    if (innerDimDst != innerDimSrc)
-      return failure();
     auto *ctx = srcEnc.getContext();
-
-    // CTALayout can be all 1's because we bailed on multi-CTA layouts above.
-    auto CTALayout = CTALayoutAttr::get(
-        ctx,
-        /*CTAsPerCGA=*/SmallVector<unsigned>(dstShape.size(), 1),
-        /*CTASplitNum=*/SmallVector<unsigned>(dstShape.size(), 1),
-        /*CTAOrder=*/llvm::to_vector(llvm::seq<unsigned>(dstShape.size())));
-    dstEnc = NVMMASharedEncodingAttr::get(
-        ctx, mmaEncoding.getSwizzlingByteWidth(), mmaEncoding.getTransposed(),
-        mmaEncoding.getElementBitWidth(), mmaEncoding.getFp4Padded(),
-        CTALayout);
-    // Big guns, check linear layouts are equivalent
-    // We disallow reshaping memdesc_subslice in the verifier
-    auto srcLL = toLinearLayout(srcShape, srcEnc, srcShape);
-    auto dstLL = toLinearLayout(dstShape, dstEnc, dstShape);
-    if (reshapeLayout(ctx, srcLL, dstShape) != dstLL) {
-      return failure();
+    if (getNumCTAs(mmaEncoding) == 1) {
+      int innerDimDst =
+          mmaEncoding.getTransposed() ? dstShape.front() : dstShape.back();
+      int innerDimSrc =
+          mmaEncoding.getTransposed() ? srcShape.front() : srcShape.back();
+      // We can keep an NVMMAShared encoding only if the innermost dimension is
+      // preserved. Otherwise fall back to the generic shared-linear encoding
+      // logic below.
+      if (innerDimDst == innerDimSrc) {
+        auto CTALayout = CTALayoutAttr::get(
+            ctx,
+            /*CTAsPerCGA=*/SmallVector<unsigned>(dstShape.size(), 1),
+            /*CTASplitNum=*/SmallVector<unsigned>(dstShape.size(), 1),
+            /*CTAOrder=*/llvm::to_vector(llvm::seq<unsigned>(dstShape.size())));
+        auto candidateEncoding = NVMMASharedEncodingAttr::get(
+            ctx, mmaEncoding.getSwizzlingByteWidth(),
+            mmaEncoding.getTransposed(), mmaEncoding.getElementBitWidth(),
+            mmaEncoding.getFp4Padded(), CTALayout);
+        auto srcLL = toLinearLayout(srcShape, srcEnc);
+        auto dstLL = toLinearLayout(dstShape, candidateEncoding);
+        if (reshapeLayout(ctx, srcLL, dstShape) == dstLL) {
+          dstEnc = candidateEncoding;
+          return success();
+        }
+      }
     }
-    return success();
   }
-  return failure();
+
+  // Generic LL case
+  auto sharedEnc = cast<SharedEncodingTrait>(srcEnc);
+  auto *ctx = srcEnc.getContext();
+  auto srcLL = toLinearLayout(srcShape, srcEnc);
+  auto dstLL = reshapeLayout(ctx, srcLL, dstShape);
+  dstEnc = SharedLinearEncodingAttr::get(ctx, dstLL, sharedEnc.getAlignment());
+  return success();
 }
 
 LogicalResult MemDescReshapeOp::inferReturnTypes(
@@ -622,13 +683,6 @@ LogicalResult MemDescReshapeOp::inferReturnTypes(
   inferredReturnType = MemDescType::get(
       dstShape, srcTy.getElementType(), dstEncoding, srcTy.getMemorySpace(),
       srcTy.getMutableMemory(), dstAllocShape);
-  return success();
-}
-
-// MemDescReinterpretOp
-LogicalResult MemDescReinterpretOp::verify() {
-  if (getSrc().getType().getMemorySpace() != getType().getMemorySpace())
-    return emitError("source and destination memory space must match");
   return success();
 }
 
@@ -857,7 +911,16 @@ LogicalResult MemDescSubsliceOp::verify() {
   }
 
   auto ctx = getContext();
-  auto ll = triton::gpu::toLinearLayout(srcTy);
+  LinearLayout ll;
+  if (auto paddedEncoding = dyn_cast<PaddedSharedEncodingAttr>(srcEnc)) {
+    if (paddedEncoding.getRank() < srcTy.getRank()) {
+      return emitError("SubSlice of low rank PaddedSharedEncoding from higher "
+                       "rank tensors is not supported yet");
+    }
+    ll = paddedEncoding.getLinearComponent();
+  } else {
+    ll = triton::gpu::toLinearLayout(srcTy);
+  }
   // NYI: We don't support non-trivial block dimension for now.
   auto kBlock = mlir::StringAttr::get(getContext(), "block");
   if (ll.getInDimSize(kBlock) != 1) {
@@ -954,6 +1017,12 @@ LogicalResult WarpSpecializeOp::verify() {
   if ((*this)->getParentOfType<WarpSpecializeOp>()) {
     return emitOpError(
         "cannot be nested inside another `ttg.warp_specialize` op");
+  }
+
+  std::optional<int> numWarps = maybeLookupNumWarps(*this);
+  if (numWarps && *numWarps % 4 != 0) {
+    return mlir::emitError(getLoc()) << "warp-specialized kernels requires "
+                                        "num_warps to be a multiple of 4";
   }
 
   return success();

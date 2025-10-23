@@ -263,6 +263,163 @@ public:
   }
 };
 
+// Optimize local_load -> tmem_store when the layout 16x256b allows better
+// code generation for local_load lowering.
+class TMemFromSharedMemPattern : public OpRewritePattern<TMEMStoreOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TMEMStoreOp tmemStoreOp,
+                                PatternRewriter &rewriter) const override {
+    auto tmemEnc = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+        tmemStoreOp.getDst().getType().getEncoding());
+    if (!tmemEnc)
+      return failure();
+    int M = tmemEnc.getBlockM();
+    int N = tmemEnc.getBlockN();
+    int numWarps = ttg::lookupNumWarps(tmemStoreOp);
+    // Compute the alternative layout.
+    std::optional<LinearLayout> ll = gpu::getTmemLoadStoreLayout16x256(
+        M, N, tmemStoreOp.getSrc().getType(), numWarps);
+    if (!ll)
+      return failure();
+    Attribute newEncoding =
+        gpu::LinearEncodingAttr::get(tmemStoreOp.getContext(), *ll);
+    auto newType = RankedTensorType::get(
+        tmemStoreOp.getSrc().getType().getShape(),
+        tmemStoreOp.getSrc().getType().getElementType(), newEncoding);
+    if (newType == tmemStoreOp.getSrc().getType())
+      return failure();
+
+    SetVector<Value> slice;
+    DenseMap<Value, Attribute> layoutMap;
+    // Check how it may propagate up the SSA chain.
+    LogicalResult result = getConvertBackwardSlice(
+        tmemStoreOp.getSrcMutable(), slice, newEncoding, layoutMap);
+    if (result.failed())
+      return failure();
+    bool foundImprovedLoad = false;
+    for (Value v : slice) {
+      auto localLoad = v.getDefiningOp<gpu::LocalLoadOp>();
+      if (!localLoad)
+        continue;
+      // 16x256b is optimized for 16bits load.
+      if (localLoad.getType().getElementType().getIntOrFloatBitWidth() != 16)
+        return failure();
+      LinearLayout regLayout = gpu::toLinearLayout(localLoad.getType());
+      LinearLayout smemLayout =
+          gpu::toLinearLayout(localLoad.getSrc().getType());
+      int vecDim =
+          regLayout.invertAndCompose(smemLayout).getNumConsecutiveInOut();
+      // If we find a 16bits load that cannot be vectorized use the alternative
+      // layout.
+      if (vecDim != 1)
+        return failure();
+      foundImprovedLoad = true;
+    }
+    if (!foundImprovedLoad)
+      return failure();
+    // Use the new layout and rely on RemoveLayoutConversions pass to propagate
+    // the convert_layout.
+    auto cvt = rewriter.create<ttg::ConvertLayoutOp>(
+        tmemStoreOp.getLoc(), newType, tmemStoreOp.getSrc());
+    rewriter.modifyOpInPlace(tmemStoreOp, [&]() {
+      tmemStoreOp.getSrcMutable().assign(cvt.getResult());
+    });
+    return success();
+  }
+};
+
+// Optimize tmem_load -> local_store when the layout 16x256b allows better
+// code generation for local_store lowering.
+class TMemToSharedMemPattern : public OpRewritePattern<TMEMLoadOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TMEMLoadOp tmemLoadOp,
+                                PatternRewriter &rewriter) const override {
+    auto tmemEnc = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+        tmemLoadOp.getSrc().getType().getEncoding());
+    if (!tmemEnc)
+      return failure();
+    int M = tmemEnc.getBlockM();
+    int N = tmemEnc.getBlockN();
+    int numWarps = ttg::lookupNumWarps(tmemLoadOp);
+    // Compute the alternative layout.
+    std::optional<LinearLayout> ll =
+        gpu::getTmemLoadStoreLayout16x256(M, N, tmemLoadOp.getType(), numWarps);
+    if (!ll)
+      return failure();
+    Attribute newEncoding =
+        gpu::LinearEncodingAttr::get(tmemLoadOp.getContext(), *ll);
+    auto newType = RankedTensorType::get(tmemLoadOp.getType().getShape(),
+                                         tmemLoadOp.getType().getElementType(),
+                                         newEncoding);
+    if (newType == tmemLoadOp.getType())
+      return failure();
+
+    SetVector<Value> slice;
+    DenseMap<Value, Attribute> layoutMap;
+    SmallVector<std::pair<Value, Attribute>> uses;
+    uses.push_back({tmemLoadOp.getResult(), newEncoding});
+    bool foundImprovedStore = false;
+    llvm::DenseSet<std::pair<Value, Attribute>> visited;
+    while (!uses.empty()) {
+      auto [v, encoding] = uses.pop_back_val();
+      if (!visited.insert({v, encoding}).second)
+        continue;
+      for (auto user : v.getUsers()) {
+        if (auto localStore = dyn_cast<gpu::LocalStoreOp>(user)) {
+          // Check if the store benefits from the new layout.
+          // 16x256b is optimized for 16bits load.
+          auto srcType = localStore.getSrc().getType();
+          if (srcType.getElementType().getIntOrFloatBitWidth() >= 32)
+            continue;
+          LinearLayout regLayout = gpu::toLinearLayout(srcType);
+          LinearLayout smemLayout =
+              gpu::toLinearLayout(localStore.getDst().getType());
+          int vecDim =
+              regLayout.invertAndCompose(smemLayout).getNumConsecutiveInOut();
+          // If we find a 8 or 16bits store that cannot be vectorized use the
+          // alternative layout.
+          // TODO: we could refine the logic to make sure the new layout would
+          // help by allowing stmatrix if we can isolate good helpers.
+          if (vecDim != 1)
+            continue;
+          foundImprovedStore = true;
+          break;
+        }
+        // Don't iterate though control flow ops.
+        if (isa<RegionBranchOpInterface, scf::YieldOp, BranchOpInterface>(user))
+          continue;
+        Attribute userEncoding = inferDstEncoding(user, encoding);
+        if (!userEncoding) {
+          if (isa<ttg::ConvertLayoutOp>(user)) {
+            userEncoding = encoding;
+          } else {
+            continue;
+          }
+        }
+        for (auto result : user->getResults()) {
+          uses.push_back({result, userEncoding});
+        }
+      }
+    }
+    if (!foundImprovedStore)
+      return failure();
+    // Use the new layout and rely on RemoveLayoutConversions pass to propagate
+    // the convert_layout.
+    Type oldType = tmemLoadOp.getType();
+    rewriter.modifyOpInPlace(
+        tmemLoadOp, [&]() { tmemLoadOp.getResult().setType(newType); });
+    rewriter.setInsertionPointAfter(tmemLoadOp);
+    auto cvt = rewriter.create<ttg::ConvertLayoutOp>(
+        tmemLoadOp.getLoc(), oldType, tmemLoadOp.getResult());
+    rewriter.replaceAllUsesExcept(tmemLoadOp.getResult(), cvt, cvt);
+    return success();
+  }
+};
+
 } // anonymous namespace
 
 class TritonNvidiaGPUOptimizeTMemLayoutsPass
@@ -279,8 +436,8 @@ public:
 
     mlir::RewritePatternSet patterns(context);
     patterns
-        .add<TMemSplitLoadPattern, TMemStoreJoinPattern, TMemLoadReducePattern>(
-            context);
+        .add<TMemSplitLoadPattern, TMemStoreJoinPattern, TMemLoadReducePattern,
+             TMemFromSharedMemPattern, TMemToSharedMemPattern>(context);
     if (failed(applyPatternsGreedily(m, std::move(patterns))))
       signalPassFailure();
   }

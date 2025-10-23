@@ -1,4 +1,5 @@
 import ast
+import builtins
 import contextlib
 import copy
 import inspect
@@ -12,11 +13,10 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, 
 
 from .. import knobs, language
 from .._C.libtriton import ir, gluon_ir
-from ..language import constexpr, str_to_ty, tensor
+from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
 from ..language.core import _unwrap_if_constexpr, base_value, base_type
-from ..runtime.jit import get_jit_fn_file_line, get_full_name
 # ideally we wouldn't need any runtime component
-from ..runtime import JITFunction
+from ..runtime.jit import get_jit_fn_file_line, get_full_name, JITCallable, BoundConstexprFunction, ConstexprFunction, JITFunction
 from .._utils import find_paths_if, get_iterable_path, set_iterable_path
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
@@ -52,7 +52,7 @@ def _is_triton_tensor(o: Any) -> bool:
 
 
 def _is_constexpr(o: Any) -> bool:
-    return o is None or isinstance(o, (constexpr, language.core.dtype, JITFunction))
+    return o is None or isinstance(o, (constexpr, language.core.dtype, JITCallable))
 
 
 def _is_non_scalar_tensor(o: Any) -> bool:
@@ -396,7 +396,7 @@ class CodeGenerator(ast.NodeVisitor):
                     val is absent,
                     name in self.builtin_namespace,  #
                     type(val) is ModuleType,  #
-                    isinstance(val, JITFunction),  #
+                    isinstance(val, JITCallable),  #
                     getattr(val, "__triton_builtin__", False),  #
                     getattr(val, "__triton_aggregate__", False),  #
                     getattr(val, "__module__", "").startswith("triton.language"),  #
@@ -528,6 +528,21 @@ class CodeGenerator(ast.NodeVisitor):
         elts = language.tuple([self.visit(elt) for elt in node.elts])
         return elts
 
+    def visit_ListComp(self, node: ast.ListComp):
+        if len(node.generators) != 1:
+            raise ValueError("nested comprehensions are not supported")
+
+        comp = node.generators[0]
+        iter = self.visit(comp.iter)
+        if not isinstance(iter, tl_tuple):
+            raise NotImplementedError("only tuple comprehensions are supported")
+
+        results = []
+        for item in iter:
+            self.set_value(comp.target.id, item)
+            results.append(self.visit(node.elt))
+        return tl_tuple(results)
+
     # By design, only non-kernel functions can return
     def visit_Return(self, node):
         ret_value = self.visit(node.value)
@@ -629,6 +644,12 @@ class CodeGenerator(ast.NodeVisitor):
 
     def visit_arg(self, node):
         ast.NodeVisitor.generic_visit(self, node)
+        param = next(p for p in self.jit_fn.params if p.name == node.arg)
+        if param.is_constexpr and (param.do_not_specialize or param.do_not_specialize_on_alignment):
+            raise CompilationError(
+                self.jit_fn.src, node,
+                f"{node.arg} marked as constexpr and listed in do_not_specialize/do_not_specialize_on_alignment. "
+                "Remove constexpr designation to skip specialization.")
         return node.arg
 
     def visit_AnnAssign(self, node):
@@ -656,9 +677,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self.assignTarget(target, value.values[i])
             return
         if isinstance(target, ast.Attribute):
-            base = self.visit(target.value)
-            setattr(base, target.attr, value)
-            return
+            raise NotImplementedError("Attribute assignment is not supported in triton")
         assert isinstance(target, ast.Name)
         self.set_value(self.visit(target), value)
 
@@ -708,7 +727,7 @@ class CodeGenerator(ast.NodeVisitor):
         args = [self.visit(x) for x in node.elts]
         return language.tuple(args)
 
-    def _apply_binary_method(self, method_name, lhs, rhs):
+    def _apply_binary_method(self, node, method_name, lhs, rhs):
         # TODO: raise something meaningful if getattr fails below, esp for reverse method
         if _is_triton_tensor(lhs):
             return getattr(lhs, method_name)(rhs, _semantic=self.semantic)
@@ -717,7 +736,11 @@ class CodeGenerator(ast.NodeVisitor):
             return getattr(rhs, reverse_method_name)(lhs, _semantic=self.semantic)
         if not isinstance(lhs, (constexpr, language.tuple)) and isinstance(rhs, constexpr):
             lhs = constexpr(lhs)
-        return getattr(lhs, method_name)(rhs)
+        if isinstance(lhs, constexpr):
+            fn = getattr(lhs, method_name)
+        else:
+            fn = self.get_Attribute(lhs, method_name)
+        return self.call_Function(node, fn, [rhs], {})
 
     def visit_BinOp(self, node):
         lhs = self.visit(node.left)
@@ -726,7 +749,7 @@ class CodeGenerator(ast.NodeVisitor):
         if method_name is None:
             raise self._unsupported(node,
                                     "AST binary operator '{}' is not (currently) implemented.".format(node.op.__name__))
-        return self._apply_binary_method(method_name, lhs, rhs)
+        return self._apply_binary_method(node, method_name, lhs, rhs)
 
     _method_name_for_bin_op: Dict[Type[ast.operator], str] = {
         ast.Add: '__add__',
@@ -998,7 +1021,7 @@ class CodeGenerator(ast.NodeVisitor):
         if method_name is None:
             raise self._unsupported(
                 node, "AST comparison operator '{}' is not (currently) implemented.".format(node.ops[0].__name__))
-        return self._apply_binary_method(method_name, lhs, rhs)
+        return self._apply_binary_method(node, method_name, lhs, rhs)
 
     _method_name_for_comp_op: Dict[Type[ast.cmpop], str] = {
         ast.Eq: '__eq__', ast.NotEq: '__ne__', ast.Lt: '__lt__', ast.LtE: '__le__', ast.Gt: '__gt__', ast.GtE: '__ge__'
@@ -1026,7 +1049,8 @@ class CodeGenerator(ast.NodeVisitor):
     def _verify_loop_carried_variable(self, name, loop_val, live_val):
         assert _is_triton_value(loop_val), f'cannot reassign constexpr {name} in the loop'
         assert _is_triton_value(live_val), f'cannot reassign constexpr {name} in the loop'
-        assert type(loop_val) is type(live_val), f'Loop carried variable {name} changed type'
+        assert type(loop_val) is type(live_val), (
+            f'Loop carried variable {name} changed type, was {type(loop_val)} but is now {type(live_val)}')
         assert not _is_triton_tensor(loop_val) or loop_val.type == live_val.type, \
             f'Loop-carried variable {name} has initial type {live_val.type} '\
             f'but is re-assigned to {loop_val.type} in loop! '\
@@ -1052,6 +1076,10 @@ class CodeGenerator(ast.NodeVisitor):
                 self.local_defs[name] = val
                 self._maybe_set_loc_to_name(val, name)
             cond = self.visit(node.test)
+            if isinstance(cond, language.condition):
+                if cond.disable_licm:
+                    while_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
+                cond = cond.condition
             self.builder.set_insertion_point_to_end(before_block)
             # create ConditionOp: e.g., scf.condition(%cond) %arg0, %arg1, ...
             self.builder.create_condition_op(cond.handle, block_args)
@@ -1094,10 +1122,7 @@ class CodeGenerator(ast.NodeVisitor):
         return lhs[slices]
 
     def visit_Subscript_Store(self, node, value):
-        assert isinstance(node.ctx, ast.Store)
-        lhs = self.visit(node.value)
-        slices = self.visit(node.slice)
-        self.call_Method(node, lhs.__setitem__, lhs, [slices, value], {})
+        raise NotImplementedError("__setitem__ is not supported in triton")
 
     def visit_Subscript(self, node):
         return self.visit_Subscript_Load(node)
@@ -1123,6 +1148,7 @@ class CodeGenerator(ast.NodeVisitor):
         disallow_acc_multi_buffer = False
         flatten = False
         warp_specialize = False
+        disable_licm = False
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -1136,6 +1162,7 @@ class CodeGenerator(ast.NodeVisitor):
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
+            disable_licm = iterator.disable_licm
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1157,6 +1184,12 @@ class CodeGenerator(ast.NodeVisitor):
         # induction variable type
         if not lb.dtype.is_int() or not ub.dtype.is_int() or not step.dtype.is_int():
             raise TypeError(f"For loop bounds and step must all be ints, are ({lb.dtype}, {ub.dtype}, {step.dtype})")
+        if _is_non_scalar_tensor(lb):
+            raise TypeError(f"For lower bound must be a scalar, got {lb.type}")
+        if _is_non_scalar_tensor(ub):
+            raise TypeError(f"For upper bound must be a scalar, got {ub.type}")
+        if _is_non_scalar_tensor(step):
+            raise TypeError(f"For step must be a scalar, got {step.type}")
         iv_type = self.semantic.integer_promote_impl(lb.dtype, ub.dtype)
         iv_type = self.semantic.integer_promote_impl(iv_type, step.dtype)
         iv_ir_type = iv_type.to_ir(self.builder)
@@ -1192,6 +1225,8 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
+            if disable_licm:
+                for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 
             self.scf_stack.append(node)
             for_op_body = for_op.get_body(0)
@@ -1299,15 +1334,20 @@ class CodeGenerator(ast.NodeVisitor):
         return next(unflatten_ir_values(handles, [callee_ret_type]))
 
     def call_Function(self, node, fn, args, kws):
-        if isinstance(fn, BoundJITMethod):
+        if isinstance(fn, (BoundJITMethod, BoundConstexprFunction)):
             args.insert(0, fn.__self__)
             fn = fn.__func__
         if isinstance(fn, JITFunction):
             _check_fn_args(node, fn, args)
             return self.call_JitFunction(fn, args, kws)
-        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn):
+        if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn) or isinstance(
+                fn, ConstexprFunction):
             extra_kwargs = dict()
-            sig = inspect.signature(fn)
+
+            if isinstance(fn, ConstexprFunction):
+                sig = inspect.signature(fn.__call__)
+            else:
+                sig = inspect.signature(fn)
             if '_semantic' in sig.parameters:
                 extra_kwargs["_semantic"] = self.semantic
             if '_generator' in sig.parameters:
@@ -1329,10 +1369,18 @@ class CodeGenerator(ast.NodeVisitor):
                 # be in core.py.
                 raise CompilationError(self.jit_fn.src, node, str(e)) from e
 
-        if fn in self.builtin_namespace.values():
+        if fn in self.builtin_namespace.values() or (hasattr(fn, '__self__') and not _is_triton_value(fn.__self__)):
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
-        return _apply_to_tuple_values(ret, lambda x: x) if _is_namedtuple(type(ret)) else ret
+
+        def wrap_constexpr(x):
+            if _is_triton_value(x):
+                return x
+            return constexpr(x)
+
+        if isinstance(ret, (builtins.tuple, language.tuple)):
+            return _apply_to_tuple_values(ret, wrap_constexpr)
+        return wrap_constexpr(ret)
 
     def call_Method(self, node, fn, fn_self, args, kws):
         if isinstance(fn, JITFunction):
@@ -1408,7 +1456,7 @@ class CodeGenerator(ast.NodeVisitor):
         while len(nontrivial_values) >= 2:
             rhs = nontrivial_values.pop()
             lhs = nontrivial_values.pop()
-            res = self._apply_binary_method(method_name, lhs, rhs)
+            res = self._apply_binary_method(node, method_name, lhs, rhs)
             nontrivial_values.append(res)
 
         assert len(nontrivial_values) == 1
@@ -1416,17 +1464,26 @@ class CodeGenerator(ast.NodeVisitor):
 
     _method_name_for_bool_op: Dict[Type[ast.boolop], str] = {ast.And: 'logical_and', ast.Or: 'logical_or'}
 
-    def visit_Attribute(self, node):
-        lhs = self.visit(node.value)
-        if _is_triton_tensor(lhs) and node.attr == "T":
+    def get_Attribute(self, lhs, attr):
+        if _is_triton_tensor(lhs) and attr == "T":
             return self.semantic.permute(lhs, (1, 0))
         # NOTE: special case ".value" for BC
-        if isinstance(lhs, constexpr) and node.attr not in ("value", "type"):
+        if isinstance(lhs, constexpr) and attr not in ("value", "type"):
             lhs = lhs.value
-        attr = getattr(lhs, node.attr)
+        attr = getattr(lhs, attr)
         if _is_triton_value(lhs) and isinstance(attr, JITFunction):
             return BoundJITMethod(lhs, attr)
         return attr
+
+    def visit_Attribute(self, node):
+        lhs = self.visit(node.value)
+        if isinstance(lhs, ModuleType):
+            # follow module_map until reaching fixed-point:
+            while (name := lhs.__name__) in self.builder.module_map:
+                lhs = self.builder.module_map[name]
+                if lhs.__name__ == name:
+                    break
+        return self.get_Attribute(lhs, node.attr)
 
     def visit_Expr(self, node):
         node.value._is_unused = True
@@ -1538,9 +1595,24 @@ class CodeGenerator(ast.NodeVisitor):
 
 def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None):
     arg_types = [None] * len(fn.arg_names)
+
     for k, v in src.signature.items():
         idx = fn.arg_names.index(k)
-        arg_types[idx] = str_to_ty(v)
+        arg_types[idx] = str_to_ty(v, None)
+
+    def apply_constexpr_types(argument, indices, value):
+        index = indices.pop()
+        if len(indices) == 0:
+            if isinstance(argument, list):
+                argument[index] = constexpr(value).type
+            else:
+                argument.types[index] = constexpr(value).type
+        else:
+            apply_constexpr_types(argument[index], indices, value)
+
+    for path, value in src.constants.items():
+        apply_constexpr_types(arg_types, list(path)[::-1], value)
+
     prototype = ASTFunction([], arg_types, src.constants, src.attrs)
     file_name, begin_line = get_jit_fn_file_line(fn)
     # query function representation
@@ -1553,7 +1625,11 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
                               jit_fn=fn, is_kernel=True, file_name=file_name, begin_line=begin_line, options=options,
                               codegen_fns=codegen_fns, module_map=module_map, module=module, is_gluon=fn.is_gluon())
     generator.visit(fn.parse())
-    ret = generator.module
+    module = generator.module
     # module takes ownership of the context
-    ret.context = context
-    return ret
+    module.context = context
+    if not module.verify():
+        if not fn.is_gluon():
+            print(module)
+        raise RuntimeError("error encountered during parsing")
+    return module

@@ -15,8 +15,7 @@
 #include <unordered_map>
 
 // LinearLayoutCache Utils
-using CacheKey =
-    std::tuple<std::vector<int64_t>, mlir::Attribute, std::vector<int64_t>>;
+using CacheKey = std::tuple<std::vector<int64_t>, mlir::Attribute>;
 
 namespace llvm {
 template <typename T> size_t hash_value(const std::vector<T> &vec) {
@@ -49,6 +48,7 @@ constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
+int lookupNumWarps(Region *region);
 // Try to find the contextual number of warps on which this operation is
 // executed. Returns nullopt if a warp size cannot be find. This is used for
 // verifiers.
@@ -57,6 +57,7 @@ std::optional<int> maybeLookupNumWarps(Operation *op);
 // FIXME: Make this API and that of maybeLookupNumWarps consistent!
 // Utility to find the number of threads per warp
 int lookupThreadsPerWarp(OpBuilder &rewriter);
+int lookupNumCTAs(OpBuilder &rewriter);
 
 template <typename Key, typename Value> class Cache {
 public:
@@ -211,16 +212,6 @@ SmallVector<unsigned> getCTASplitNum(Attribute layout);
 
 SmallVector<unsigned> getCTAOrder(Attribute layout);
 
-/* The difference between ShapePerCTATile and ShapePerCTA:
- * (1) ShapePerCTATile is defined by SizePerThread * ThreadsPerWarp *
- *     WarpsPerCTA in each dimension and is independent from the tensor shape.
- * (2) ShapePerCTA is defined by shape / CTASplitNum in each dimension.
- * (3) In the implementation of emitIndices, ShapePerCTATile will
- *     be replicated or wrapped to fit ShapePerCTA.
- */
-// [FIXME LL] Kill this function
-SmallVector<unsigned> getShapePerCTATile(RankedTensorType layout);
-
 // Returns the "logical" shape per CTA.
 // When shape and CTASplitNum have different number of dimensions, we assume
 // only the last N between common dimensions are split.
@@ -282,8 +273,8 @@ llvm::SmallVector<unsigned>
 expandMatrixOrderWithBatch(llvm::ArrayRef<unsigned> o);
 
 // Return true if the two layouts represent the exact same mapping.
-bool areLayoutsEquivalent(ArrayRef<int64_t> shape, DistributedEncodingTrait lhs,
-                          DistributedEncodingTrait rhs);
+bool areLayoutsEquivalent(ArrayRef<int64_t> shape, LayoutEncodingTrait lhs,
+                          LayoutEncodingTrait rhs);
 
 // Return true if the innermost numElems are contiguous.
 bool isInnermostContiguous(MemDescType type, unsigned numElems);

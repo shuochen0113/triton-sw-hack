@@ -2,19 +2,19 @@ from __future__ import annotations
 from typing import Optional, Tuple, List, TYPE_CHECKING
 
 from dataclasses import dataclass
-import triton
+from triton.runtime.jit import constexpr_function
 from triton.experimental.gluon.language import _core as ttgl
-from triton.experimental.gluon.language._core import builtin, base_type, base_value, _unwrap_if_constexpr, constexpr_function
-from triton.experimental.gluon.language._layouts import BlockedLayout, _get_shape_per_cta
+from triton.experimental.gluon.language._core import builtin, base_type, base_value, _unwrap_if_constexpr
+from triton.experimental.gluon.language._layouts import BlockedLayout, _get_shape_per_cta, DistributedLinearLayout
 from triton.experimental.gluon.language._semantic import _check
 
 from . import tma
 from ..hopper import fence_async_shared, mbarrier
-from ..ampere import async_copy
+from ..ampere import async_copy, mma_v2
 
+from triton._C.libtriton import ir
 if TYPE_CHECKING:
     from triton._C.libtriton.gluon_ir import GluonOpBuilder
-    from triton._C.libtriton import gluon_ir as ir
     from ..._semantic import GluonSemantic
 
 __all__ = [
@@ -22,7 +22,9 @@ __all__ = [
     "async_copy",
     "fence_async_shared",
     "get_tmem_32x32b_reg_layout",
+    "get_tmem_scales_reg_layout",
     "mbarrier",
+    "mma_v2",
     "tensor_memory_descriptor",
     "TensorMemoryLayout",
     "tma",
@@ -36,30 +38,61 @@ class TensorMemoryLayout:
 
     Args:
         block (Tuple[int, int]): Tiling block dimensions (M/rows, N/cols).
-        unpacked (bool): For sub-32 bit elements, whether they are unpacked to 32 bits.
+        col_stride (int): Number of 32-bit columns to advance between logically
+            adjacent columns. Packed layouts use a stride of 1. Unpacked
+            layouts use ``32 / bitwidth``.
         cta_split_num (Optional[Tuple[int, int]]): CTA split factors. Defaults to None.
     """
     block: Tuple[int, int]
-    unpacked: bool
+    col_stride: int
     cta_split_num: Optional[Tuple[int, int]] = None
 
     def __post_init__(self):
         assert len(self.block) == 2
         assert self.cta_split_num is None or len(self.cta_split_num) == 2
+        assert self.col_stride >= 1 and (self.col_stride &
+                                         (self.col_stride - 1)) == 0, "tensor memory col_stride must be a power of two"
 
     def _to_ir(self, builder):
         cta_split_num = self.cta_split_num or [1, 1]
         return builder.get_tensor_memory_layout(
             self.block,
-            self.unpacked,
+            self.col_stride,
             cta_split_num,
         )
 
     def mangle(self) -> str:
         block_str = f"{self.block[0]}x{self.block[1]}"
-        unpacked_str = "U" if self.unpacked else "P"
+        stride_str = f"C{self.col_stride}"
+        cta_split_str = (f"CS{self.cta_split_num[0]}x{self.cta_split_num[1]}" if self.cta_split_num else "")
+        return f"TL{block_str}{stride_str}{cta_split_str}TL"
+
+
+@dataclass(frozen=True, eq=True)
+class TensorMemoryScalesLayout:
+    """
+    Describes the layout for tensor memory scales in Blackwell architecture.
+
+    Args:
+        cta_split_num (Optional[Tuple[int, int]]): CTA split factors. Defaults to None.
+    """
+    cta_split_num: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        assert self.cta_split_num is None or len(self.cta_split_num) == 2
+
+    def _to_ir(self, builder):
+        cta_split_num = self.cta_split_num or [1, 1]
+        return builder.get_tensor_memory_scales_layout(cta_split_num, )
+
+    def mangle(self) -> str:
         cta_split_str = f"CS{self.cta_split_num[0]}x{self.cta_split_num[1]}" if self.cta_split_num else ""
-        return f"TL{block_str}{unpacked_str}{cta_split_str}TL"
+        return f"TLS{cta_split_str}TLS"
+
+
+@constexpr_function
+def _cdiv(x, div):
+    return (x + div - 1) // div
 
 
 @constexpr_function
@@ -77,19 +110,19 @@ def get_tmem_32x32b_reg_layout(M, N, shape, num_warps, ctas_per_cga=None, cta_sp
     if M == 64:
         threads_per_warp = [16, 2]
         if num_blocks == 1:
-            size_per_thread = [1, triton.cdiv(N, num_warp_groups * 2)]
+            size_per_thread = [1, _cdiv(N, num_warp_groups * 2)]
             warps_per_cta = [4, num_warp_groups]
         else:
-            size_per_thread = [1, triton.cdiv(N, 2)]
+            size_per_thread = [1, _cdiv(N, 2)]
             warps_per_cta = [4 * min(blocks_per_tile[0], num_warp_groups)]
-            warps_per_cta.append(triton.cdiv(num_warp_groups, warps_per_cta[0] // 4))
+            warps_per_cta.append(_cdiv(num_warp_groups, warps_per_cta[0] // 4))
     else:
         if shape[0] > 128:
             size_per_thread = [1, N]
             threads_per_warp = [32, 1]
             warps_per_cta = [4 * num_warp_groups, 1]
         else:
-            size_per_thread = [1, triton.cdiv(N, num_warp_groups)]
+            size_per_thread = [1, _cdiv(N, num_warp_groups)]
             threads_per_warp = [32, 1]
             warps_per_cta = [4, num_warp_groups]
     return BlockedLayout(
@@ -103,6 +136,59 @@ def get_tmem_32x32b_reg_layout(M, N, shape, num_warps, ctas_per_cga=None, cta_sp
     )
 
 
+@constexpr_function
+def get_tmem_scales_reg_layout(M, N, shape, num_warps, ctas_per_cga=None, cta_split_num=None, cta_order=None):
+    """Return a linear layout that is compatible with tmem scaled layout.
+    """
+    assert len(shape) == 2, "expected a 2D tensor"
+    assert num_warps in [4, 8], "expected 4 or 8 warps"
+
+    # Use per-CTA shape to build the linear layout bases
+    shape_per_cta = _get_shape_per_cta(shape, cta_split_num)
+    M_cta, N_cta = shape_per_cta[0], shape_per_cta[1]
+
+    # Register bases: pack 4 scales together along N; if fewer than 4, replicate.
+    reg_bases = []
+    i = 1
+    while i < 4:
+        if i >= N_cta:
+            reg_bases.append([0, 0])
+        else:
+            reg_bases.append([0, i])
+        i <<= 1
+
+    # Lane bases: distribute 32 rows of M along a warp.
+    lane_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]]
+
+    # Warp bases: replicate across warps within a warpgroup by default.
+    warp_bases = [[0, 0], [0, 0]]
+
+    # Extend register bases for larger M and N beyond the initial pack.
+    i = 32
+    while i < M_cta:
+        reg_bases.append([i, 0])
+        i <<= 1
+
+    i = 4
+    while i < N_cta:
+        reg_bases.append([0, i])
+        i <<= 1
+
+    # For 8 warps, distribute the last dimension on the second warpgoup.
+    if num_warps == 8:
+        warp_bases.append(reg_bases[-1])
+        reg_bases.pop()
+
+    # No explicit CTA mapping here; the register layout is per-CTA.
+    return DistributedLinearLayout(
+        reg_bases=reg_bases,
+        lane_bases=lane_bases,
+        warp_bases=warp_bases,
+        block_bases=[],
+        shape=shape_per_cta,
+    )
+
+
 class tensor_memory_descriptor_type(base_type):
 
     def __init__(self, element_ty, shape, layout, alloc_shape):
@@ -110,7 +196,7 @@ class tensor_memory_descriptor_type(base_type):
         self.shape = shape
         self.layout = layout
         self.alloc_shape = alloc_shape
-        assert isinstance(layout, TensorMemoryLayout)
+        assert isinstance(layout, TensorMemoryLayout) or isinstance(layout, TensorMemoryScalesLayout)
 
     def to_ir(self, builder: GluonOpBuilder) -> None:
         return builder.get_tensor_mem_desc_ty(
@@ -223,8 +309,11 @@ class tensor_memory_descriptor(base_value):
         _check(isinstance(length, int), lambda: "length must be a constant int")
         shape = self.shape[:-1] + [length]
         layout = self.type.layout
-        layout = TensorMemoryLayout((layout.block[0], min(layout.block[1], length)), layout.unpacked,
-                                    layout.cta_split_num)
+        layout = TensorMemoryLayout(
+            (layout.block[0], min(layout.block[1], length)),
+            layout.col_stride,
+            layout.cta_split_num,
+        )
         ret = tensor_memory_descriptor(None, self.dtype, shape, layout, self.type.alloc_shape)
         builder = _semantic.builder
         ret.handle = builder.create_tmem_subslice(ret.type.to_ir(builder), self.handle, start)
@@ -297,6 +386,23 @@ def allocate_tensor_memory(element_ty, shape, layout, value=None, _semantic=None
 
 
 @builtin
+def tcgen05_copy(src, dst, _semantic=None):
+    """
+    Start an asynchronous copy from shared memory to tensor memory.
+
+    WARNING: The current semantics of the instruction are not well defined and
+    the API will change in the future. Use at your own risk.
+
+    Args:
+        src (shared_memory_descriptor): Shared memory to copy from.
+        dst (tensor_memory_descriptor): Tensor memory to copy to.
+    """
+    assert isinstance(src, ttgl.shared_memory_descriptor), "source must be a shared memory descriptor"
+    assert isinstance(dst, tensor_memory_descriptor), "destination must be a tensor memory descriptor"
+    _semantic.builder.create_tmem_copy(src.handle, dst.handle)
+
+
+@builtin
 def tcgen05_mma(a, b, acc, *, use_acc=True, pred=True, mbarriers=None, mbarrier_preds=None, _semantic=None):
     """
     Emit a 5th generation TensorCore MMA instruction.
@@ -331,5 +437,57 @@ def tcgen05_mma(a, b, acc, *, use_acc=True, pred=True, mbarriers=None, mbarrier_
 
 
 @builtin
+def tcgen05_mma_scaled(a, b, acc, a_scale, b_scale, a_type, b_type, *, use_acc=True, pred=True, mbarriers=None,
+                       mbarrier_preds=None, _semantic=None):
+    """
+    Emit a 5th generation TensorCore MMA scaled instruction.
+    acc = (a * a_scale) * (b * b_scale) + (acc if use_acc else 0)
+
+    Args:
+        a (shared_memory_descriptor): Left hand side operand in shared memory.
+        b (shared_memory_descriptor or tensor_memory_descriptor): Right hand side operand in shared or tensor memory.
+        acc (tensor_memory_descriptor): Accumulator value in tensor memory (mutated).
+        a_scale (tensor): Scale factor for operand A.
+        b_scale (tensor): Scale factor for operand B.
+        a_type (str): Type of operand A. One of {"e2m1", "e4m3", "e5m2"}.
+        b_type (str): Type of operand B. One of {"e2m1", "e4m3", "e5m2"}.
+        use_acc (bool): Whether to use the initial value of the accumulator. Defaults to True.
+        pred (bool): Scalar predicate. Operation is skipped if predicate is False. Defaults to True.
+        mbarriers (Sequence[mbarrier], optional): Barriers to signal when the operation is complete. If None, mma is synchronous. Defaults to None.
+        mbarrier_preds (Sequence[bool], optional): Predicates for barriers. Defaults to None.
+    """
+    use_acc = _semantic.to_tensor(use_acc)
+    pred = _semantic.to_tensor(pred)
+
+    if mbarriers is None:
+        assert mbarrier_preds is None
+        mbarriers = []
+        mbarrier_preds = []
+    else:
+        mbarriers = [bar.handle for bar in mbarriers]
+        if mbarrier_preds is None:
+            true = _semantic.to_tensor(True)
+            mbarrier_preds = [true.handle] * len(mbarriers)
+        else:
+            mbarrier_preds = _semantic._convert_to_ir_values(mbarrier_preds, require_i64=False)
+
+    allowed_formats = {"e2m1", "e4m3", "e5m2"}
+    assert a_type.value in allowed_formats, f"Unsupported lhs_format: {a_type.value}"
+    assert b_type.value in allowed_formats, f"Unsupported rhs_format: {b_type.value}"
+    a_type = _semantic._str_to_fp_type(a_type.value)
+    b_type = _semantic._str_to_fp_type(b_type.value)
+    _semantic.builder.create_tcgen05_mma_scaled(a.handle, b.handle, acc.handle, a_scale.handle, b_scale.handle, a_type,
+                                                b_type, use_acc.handle, pred.handle, mbarriers, mbarrier_preds)
+
+
+@builtin
 def tcgen05_commit(barrier, _semantic=None):
+    """
+    This instruction causes the provided mbarrier to be arrived-on with a count
+    of 1 when all async tcgen05 MMA and copy instructions previously issued by
+    the thread are complete.
+
+    Args:
+        barrier (shared_memory_descriptor): The barrier to track completion of tcgen05 MMA and copy instructions.
+    """
     _semantic.builder.create_tcgen05_commit(barrier.handle)

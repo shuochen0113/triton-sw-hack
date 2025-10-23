@@ -113,17 +113,13 @@ LinearLayout buildReps(MLIRContext *ctx, const LinearLayout &src,
   SetVector<int32_t> srcRegs(llvm::from_range_t{}, flatten(src, kReg));
   SetVector<int32_t> dstRegs(llvm::from_range_t{}, flatten(dst, kReg));
   SetVector<int32_t> smemSegment(llvm::from_range_t{}, flatten(smem, kSegment));
-  SetVector<int32_t> reps;
-  for (int32_t b : srcRegs) {
-    if (dstRegs.contains(b) && smemSegment.contains(b)) {
-      reps.insert(b);
-    }
-  }
-  // Split segment into segment and reps
   SetVector<int32_t> segment;
-  for (int32_t b : flatten(smem, kSegment)) {
-    if (!reps.contains(b)) {
-      segment.insert(b);
+  SetVector<int32_t> reps;
+  for (auto s : smemSegment) {
+    if (srcRegs.contains(s) && dstRegs.contains(s)) {
+      reps.insert(s);
+    } else {
+      segment.insert(s);
     }
   }
 
@@ -235,37 +231,30 @@ SmallVector<int32_t> intersectionBasis(ArrayRef<int32_t> b1,
   }
 }
 
-std::pair<int, int> logBankConflicts(ArrayRef<int32_t> tileSrc,
-                                     ArrayRef<int32_t> tileDst,
-                                     const LinearLayout &smem,
-                                     int32_t bitwidth) {
+std::pair<int, int> bankConflicts(ArrayRef<int32_t> tileSrc,
+                                  ArrayRef<int32_t> tileDst,
+                                  const LinearLayout &smem) {
   auto *ctx = smem.getOutDimNames().begin()->getContext();
   auto smemFlat = smem.flattenOuts();
   auto inDim = *smem.getInDimNames().begin();
-  // Take all the bases in the first bank (32 bits)
-  auto smemBases =
-      flatten(smemFlat.flattenIns(), *smemFlat.getInDimNames().begin());
-  auto nBankZero = llvm::Log2_32(std::max<int32_t>(1, 32 / bitwidth));
-  if (smemBases.size() >= nBankZero) {
-    smemBases.resize(nBankZero);
-  }
-  // And segments
+  // Look at the intersection between the segment bases and the tile bases
+  // We don't need to intersect with the bases that covert the bank (as in
+  // the first 32 / bitwidth bases) because if we hit any of those broadcasting
+  // will avoid the bank conflict
   auto segment = StringAttr::get(ctx, "segment");
   auto segmentBases = flatten(smemFlat, segment);
-  auto bankZero =
-      llvm::to_vector(llvm::concat<int32_t>(smemBases, segmentBases));
 
   int32_t rank = smem.getTotalOutDimSizeLog2();
   // compute conflicts
-  int write = intersectionBasis(bankZero, tileSrc, rank).size();
-  int read = intersectionBasis(bankZero, tileDst, rank).size();
-  return {read, write};
+  int write = 1 << intersectionBasis(segmentBases, tileSrc, rank).size();
+  int read = 1 << intersectionBasis(segmentBases, tileDst, rank).size();
+  return {read - 1, write - 1};
 }
 
-std::pair<int, int> logBankConflictsLdSt(const LinearLayout &src,
-                                         const LinearLayout &dst,
-                                         const LinearLayout &smem,
-                                         int32_t bitwidth) {
+std::pair<int, int> bankConflictsLdSt(const LinearLayout &src,
+                                      const LinearLayout &dst,
+                                      const LinearLayout &smem,
+                                      int32_t bitwidth) {
   auto srcFlat = src.flattenOuts();
   auto dstFlat = dst.flattenOuts();
   auto *ctx = smem.getOutDimNames().begin()->getContext();
@@ -277,7 +266,36 @@ std::pair<int, int> logBankConflictsLdSt(const LinearLayout &src,
       llvm::Log2_32(std::max(smem.getInDimSize(kVec) * bitwidth / 32, 1));
   srcLane.resize(srcLane.size() - log2Vec);
   dstLane.resize(dstLane.size() - log2Vec);
-  return logBankConflicts(srcLane, dstLane, smem, bitwidth);
+  return bankConflicts(srcLane, dstLane, smem);
+}
+
+int bankConflictsMemDesc(const LinearLayout &reg, const LinearLayout &smem,
+                         int32_t bitwidth) {
+  auto *ctx = smem.getInDimNames().begin()->getContext();
+  auto S = [ctx](StringRef str) { return StringAttr::get(ctx, str); };
+
+  assert(smem.hasInDim(S("offset")) && "shared layout must have an offset dim");
+  assert(reg.hasInDim(S("register")) &&
+         "register layout must have a register dim");
+  auto regNoBroadcast = actionRemoveBroadcastedRegs(reg).apply(reg);
+  auto regToShared = regNoBroadcast.invertAndCompose(smem);
+  auto [elemsPerVec, permutation] =
+      largestVectorisation(ctx, regToShared, bitwidth);
+  regNoBroadcast = permutation.apply(regNoBroadcast);
+
+  int32_t vecSize = elemsPerVec;
+  int32_t bankSize =
+      std::min(32 * 32 / (vecSize * bitwidth), smem.getTotalInDimSize());
+  int32_t segmentSize = smem.getTotalInDimSize() / (bankSize * vecSize);
+  SmallVector<std::pair<StringAttr, int32_t>> newInDims = {
+      {S("vector"), vecSize},
+      {S("bank"), bankSize},
+      {S("segment"), segmentSize},
+  };
+  auto smemReshaped = smem.reshapeIns(newInDims);
+  return bankConflictsLdSt(regNoBroadcast, regNoBroadcast, smemReshaped,
+                           bitwidth)
+      .first;
 }
 
 std::optional<SmallVector<int32_t>> optimalSwizzlingTile(
@@ -446,6 +464,7 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   // We fill-up vbasis until it has 32 bits as best we can
   std::optional<bool> srcFillsBank = std::nullopt;
   if ((1 << vbasis.size()) * bitwidth < 32) {
+    auto basesPerBank = llvm::Log2_32(32 / bitwidth);
     auto kWarp = StringAttr::get(ctx, "warp");
     auto warpSrc = removeZeros(flatten(srcFlat, kWarp));
     auto warpDst = removeZeros(flatten(dstFlat, kWarp));
@@ -479,19 +498,15 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
       largest = srcFillsBank.value() ? regSrcWarp : regDstWarp;
     }
     vbasis.append(largest.begin(), largest.end());
-    if (vbasis.size() > maxVecBases) {
-      vbasis.resize(maxVecBases);
-    }
-    // We allow vbasis.size > Log2_32(32 / bitwidth) at this point, as it is in
-    // general good, but one should note
-    if (vbasis.size() < llvm::Log2_32(32 / bitwidth)) {
+
+    if (vbasis.size() < basesPerBank) {
       // Pad the vectorisation to 32 bits with warp bases
       auto warpSrcWarp = intersectionBasis(warpSrc, warpDst, dim);
       vbasis.append(warpSrcWarp.begin(), warpSrcWarp.end());
     }
 
     int i = 0;
-    while (vbasis.size() < llvm::Log2_32(32 / bitwidth) &&
+    while (vbasis.size() < basesPerBank &&
            (i < warpSrc.size() || i < warpDst.size())) {
       // If we have not filled up a whole bank, we add more warp bases
       // until we have 32 bits. They will at least avoid bank conflicts in one
@@ -499,25 +514,28 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
       if (i < warpSrc.size() && !llvm::is_contained(vbasis, warpSrc[i])) {
         vbasis.push_back(warpSrc[i]);
       }
-      if (vbasis.size() < llvm::Log2_32(32 / bitwidth) && i < warpDst.size() &&
+      if (vbasis.size() < basesPerBank && i < warpDst.size() &&
           !llvm::is_contained(vbasis, warpDst[i])) {
         vbasis.push_back(warpDst[i]);
       }
       ++i;
     }
+
+    // Trim to basesPerBank if we have added more
+    // The idea here is that implementing asymmetric vectorisation without bank
+    // conflicts is a bit tricky. Basically, in this case, you need to use the
+    // vectorisation base in the swizzling pattern. As such, you would not be
+    // able to vectorise all the `ld.shared` instructions that you emit, but
+    // just about half of them (the ones that are not swizzled). We don't
+    // implement this yet
+    if (vbasis.size() > basesPerBank) {
+      vbasis.resize(basesPerBank);
+    }
   }
   auto log2Vec = llvm::Log2_32(
       std::max<int32_t>(1, ((1 << vbasis.size()) * bitwidth) / 32));
-  auto tileSrc = laneSrc;
-  // If the tile is larger than 32 / bitwidth and we had to fill in the bank
-  // we just trim the tile of the value we used to fill the bank
-  if (!srcFillsBank.has_value() || srcFillsBank.value()) {
-    tileSrc.resize(tileSrc.size() - log2Vec);
-  }
-  auto tileDst = laneDst;
-  if (!srcFillsBank.has_value() || !srcFillsBank.value()) {
-    tileDst.resize(tileDst.size() - log2Vec);
-  }
+  auto tileSrc = to_vector(ArrayRef(laneSrc).drop_back(log2Vec));
+  auto tileDst = to_vector(ArrayRef(laneDst).drop_back(log2Vec));
   auto smem = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc,
                                tileDst, src.getOutDims());
 
@@ -657,20 +675,19 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
     for (auto [instrs, vbasis, tileSrc, tileDst] : tiles) {
       auto smem = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc,
                                    tileDst, src.getOutDims());
-      auto [read, write] = logBankConflicts(tileSrc, tileDst, smem, bitwidth);
+      auto [read, write] = bankConflicts(tileSrc, tileDst, smem);
       smems.push_back({read + write, smem, {instrs.first, instrs.second}});
     }
     // Current heuristic: Minimise total bank conflicts
     // We break ties looking at the number of rounds we do to move the data
-    // The lower the dat
     auto kReps = StringAttr::get(ctx, "reps");
-    llvm::sort(smems, [kReps](const auto &a, const auto &b) {
+    auto it = llvm::min_element(smems, [kReps](const auto &a, const auto &b) {
       return std::get<0>(a) < std::get<0>(b) ||
              (std::get<0>(a) == std::get<0>(b) &&
               std::get<1>(a).getInDimSize(kReps) >
                   std::get<1>(b).getInDimSize(kReps));
     });
-    return {std::get<1>(smems.front()), std::get<2>(smems.front())};
+    return {std::get<1>(*it), std::get<2>(*it)};
   }
 }
 

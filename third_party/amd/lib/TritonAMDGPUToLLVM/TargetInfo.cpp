@@ -65,7 +65,20 @@ llvm::AMDGPU::GPUKind TargetInfo::getGPUKind() const {
   return llvm::AMDGPU::parseArchAMDGCN(arch);
 }
 
-int TargetInfo::getWarpSize() const { return isCDNA(getISAFamily()) ? 64 : 32; }
+int TargetInfo::getWarpSize() const {
+  switch (getISAFamily()) {
+  case ISAFamily::CDNA1:
+  case ISAFamily::CDNA2:
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA4:
+    return 64;
+  case ISAFamily::GFX1250:
+    return 32;
+  default:
+    break;
+  }
+  return 32;
+}
 
 int TargetInfo::getSharedMemorySize() const {
   int kbytes = getISAFamily() == ISAFamily::CDNA4 ? 160 : 64;
@@ -88,6 +101,17 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
   return rewriter.create<ROCDL::BallotOp>(loc, type, cmp);
 }
 
+void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
+                         bool isWarpSync) const {
+  if (isWarpSync) {
+    LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.wave.barrier",
+                                    {}, {});
+  } else {
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    b.barrier();
+  }
+}
+
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Value val,
                               Value pred) const {
@@ -98,9 +122,20 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
 
-bool TargetInfo::canUseLDSTransLoad(int bitwidth) const {
-  return getISAFamily() == ISAFamily::CDNA4 &&
-         llvm::is_contained({16, 8, 4, 6}, bitwidth);
+std::optional<TargetInfo::LDSTransLoadParams>
+TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
+  auto isaFamily = getISAFamily();
+  bool isGFX1250 = isaFamily == AMD::ISAFamily::GFX1250;
+  bool isCDNA4 = isaFamily == AMD::ISAFamily::CDNA4;
+  bool canUseTransLoad =
+      (isCDNA4 || isGFX1250) && llvm::is_contained({16, 8, 4, 6}, bitWidth);
+  if (!canUseTransLoad)
+    return std::nullopt;
+  unsigned numLanesInShuffleGroup = getWarpSize() / 4;
+  unsigned instBitWidth = isGFX1250 && bitWidth == 16 ? 128 : 64;
+  unsigned needContigReg = instBitWidth / bitWidth;
+  return LDSTransLoadParams{numLanesInShuffleGroup, instBitWidth,
+                            needContigReg};
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
@@ -135,6 +170,14 @@ Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
 Value TargetInfo::shuffleIdx(RewriterBase &rewriter, Location loc, Value val,
                              Value i) const {
   return LLVM::AMD::shuffleIdx(loc, rewriter, val, i, getISAFamily());
+}
+
+Value TargetInfo::permute(RewriterBase &rewriter, Location loc, Value a,
+                          Value b, Value selector) const {
+  // Warning: The `a` and `b` operands are ordered to align with Nvidia's `prmt`
+  // Both use little-endian ordering, but AMD puts the MSBs of the data in the
+  // 0-th operand.
+  return LLVM::AMD::permute(loc, rewriter, b, a, selector);
 }
 
 Value TargetInfo::programId(RewriterBase &rewriter, Location loc,
@@ -279,7 +322,8 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
     return false;
   if (isCDNA(getISAFamily()) && getISAFamily() == ISAFamily::CDNA1)
     return false;
-  if (isRDNA(getISAFamily()) && getISAFamily() != ISAFamily::RDNA3)
+  if (isRDNA(getISAFamily()) &&
+      llvm::is_contained({ISAFamily::RDNA1, ISAFamily::RDNA2}, getISAFamily()))
     return false;
 
   Operation *reduxOp = op.getSingleCombiner();
@@ -559,8 +603,6 @@ bool TargetInfo::supportVectorizedAtomics() const {
 
 bool TargetInfo::supportsDirectToLdsLoadBitWidth(int bitWidth) const {
   switch (getISAFamily()) {
-  case ISAFamily::CDNA1:
-  case ISAFamily::CDNA2:
   case ISAFamily::CDNA3:
     // Disable 8 and 16 bits because they get extended to 32 bit.
     return llvm::is_contained({32, /*16, 8*/}, bitWidth);

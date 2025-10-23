@@ -55,10 +55,18 @@ public:
         tcGen5MMAOp.getD().getType().getEncoding());
     ArrayRef<unsigned> CTASplitNum =
         triton::gpu::getCTALayout(srcLayout).getCTASplitNum();
-    // TMem encoding for A operand is the same as for D (Acc), but packed.
+    // TMem encoding for A operand is the same as for D (Acc), but packed for
+    // bitwidth=16
+    unsigned elemBitWidth =
+        lhs.getType().getElementType().getIntOrFloatBitWidth();
+    // We don't currently support fp8 (not sure if we can)
+    if (elemBitWidth != 16 && elemBitWidth != 32) {
+      return failure();
+    }
+    const unsigned colStride = 1;
     auto aTMemEncoding = TensorMemoryEncodingAttr::get(
         context, accTMemEncoding.getBlockM(), lhs.getType().getShape()[1],
-        /*unpacked=*/false, CTASplitNum[0], CTASplitNum[1]);
+        colStride, CTASplitNum[0], CTASplitNum[1]);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     ttg::MemDescType lhsMemDescType = ttg::MemDescType::get(
