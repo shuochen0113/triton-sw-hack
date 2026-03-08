@@ -179,6 +179,7 @@ struct MaterializeSWSmem
         }
       });
 
+      llvm::errs() << "[MaterializeSWSmem][INFO] Found " << anchors.size() << " anchors in @" << func.getName() << "\n";
       if (anchors.empty()) return;
 
       // Create allocations at function entry so all users dominate them.
@@ -188,13 +189,15 @@ struct MaterializeSWSmem
       auto loc  = func.getLoc();
 
       // Encodings / address-space attrs
-      SmallVector<unsigned> ord2{1, 0}, ord1{0};
-      auto cta2 = ttg::CTALayoutAttr::getDefault(ctx, 2);
+      // [Fix] Use flat 1D MemDescs only. MemDescType requires all dims except the
+      // first to be power-of-2 (see Types.cpp::MemDescType::verify). STRIDE=768 is
+      // not power-of-2, so a 2D [SLOTS, STRIDE] shape fails. A 1D [SLOTS*STRIDE]
+      // shape trivially passes (drop_front(1) is empty → all_of vacuously true).
+      SmallVector<unsigned> ord1{0};
       auto cta1 = ttg::CTALayoutAttr::getDefault(ctx, 1);
       auto smem = ttg::SharedMemorySpaceAttr::get(ctx);
-      auto linearEnc2D = ttg::LinearSharedEncodingAttr::get(ctx, ord2, cta2);
       auto linearEnc1D = ttg::LinearSharedEncodingAttr::get(ctx, ord1, cta1);
-      
+
       // Cache buffers per element type.
       llvm::DenseMap<const void*, Buffers> bufMap;
       auto getOrCreateBuffers = [&](Type elemTy) -> Buffers& {
@@ -203,19 +206,20 @@ struct MaterializeSWSmem
         if (it != bufMap.end()) return it->second;
 
         Buffers B{};
-        auto ty2D_H = ttg::MemDescType::get({HSlots, STRIDE}, elemTy, linearEnc2D, smem, true);
-        auto ty2D_E = ttg::MemDescType::get({ESlots, STRIDE}, elemTy, linearEnc2D, smem, true);
-        auto ty2D_F = ttg::MemDescType::get({FSlots, STRIDE}, elemTy, linearEnc2D, smem, true);
-        
-        B.hBuf = top.create<ttg::LocalAllocOp>(loc, ty2D_H).getResult();
-        B.eBuf = top.create<ttg::LocalAllocOp>(loc, ty2D_E).getResult();
-        B.fBuf = top.create<ttg::LocalAllocOp>(loc, ty2D_F).getResult();
-        
+        // Flat 1D allocations: [SLOTS * STRIDE] elements each.
+        auto ty1D_H = ttg::MemDescType::get({HSlots * STRIDE}, elemTy, linearEnc1D, smem, true);
+        auto ty1D_E = ttg::MemDescType::get({ESlots * STRIDE}, elemTy, linearEnc1D, smem, true);
+        auto ty1D_F = ttg::MemDescType::get({FSlots * STRIDE}, elemTy, linearEnc1D, smem, true);
+
+        B.hBuf = top.create<ttg::LocalAllocOp>(loc, ty1D_H).getResult();
+        B.eBuf = top.create<ttg::LocalAllocOp>(loc, ty1D_E).getResult();
+        B.fBuf = top.create<ttg::LocalAllocOp>(loc, ty1D_F).getResult();
+
         if (elemTy.isInteger(32) && !B.inited) {
             // Initialize to a large negative sentinel to preserve correctness
             // before first write (affine gap penalties).
             auto cMINF = top.create<arith::ConstantIntOp>(loc, -10000000, 32);
-            
+
             // [Design] Read warp/thread config from module attributes; do not
             // rely on pseudo APIs. Fallbacks keep defaults sane.
             unsigned int numWarps = 1;
@@ -227,95 +231,93 @@ struct MaterializeSWSmem
             unsigned int numThreads = numWarps * threadsPerWarp;
 
             // Initialize in BLOCK=256 chunks using a BlockedEncoding on registers.
-            unsigned int sizePerThread = 2; 
+            unsigned int sizePerThread = 2;
             auto blockedEnc256 = ttg::BlockedEncodingAttr::get(ctx, {sizePerThread}, {threadsPerWarp}, {numThreads/threadsPerWarp}, {0}, cta1);
             auto initTy256 = RankedTensorType::get({BLOCK}, elemTy, blockedEnc256);
-            
+
             Value vMINF = top.create<tt::SplatOp>(loc, initTy256, cMINF);
 
-            auto initBuffer = [&](Value buf2D, int numSlots) {
-                auto slotTy1D = ttg::MemDescType::get({STRIDE}, elemTy, linearEnc1D, smem, true);
+            // [Fix] No MemDescIndexOp: compute flat offsets directly.
+            // For slot s, segment g: flat base = s*STRIDE + g*BLOCK.
+            auto initBuffer = [&](Value buf1D, int numSlots) {
                 for (int s = 0; s < numSlots; ++s) {
-                    Value cs = top.create<arith::ConstantIntOp>(loc, s, 32);
-                    Value slot1D = top.create<ttg::MemDescIndexOp>(loc, slotTy1D, buf2D, cs);
-                    // Initialize segment by segment across STRIDE
                     for (int g = 0; g < SEGS; ++g) {
-                        Value segOffset = top.create<arith::ConstantIntOp>(loc, g * BLOCK, 32);
+                        int64_t flatBase = (int64_t)s * STRIDE + (int64_t)g * BLOCK;
+                        Value segOffset = top.create<arith::ConstantIntOp>(loc, flatBase, 32);
                         Value splatSegOffset = top.create<tt::SplatOp>(loc, initTy256, segOffset);
                         Value makeRange = top.create<tt::MakeRangeOp>(loc, initTy256, 0, BLOCK);
                         Value offsetTensor = top.create<arith::AddIOp>(loc, splatSegOffset, makeRange);
-
-                        top.create<ttg::LocalStoreSliceOp>(loc, vMINF, slot1D, offsetTensor);
+                        top.create<ttg::LocalStoreSliceOp>(loc, vMINF, buf1D, offsetTensor);
                     }
                 }
             };
-            
+
             initBuffer(B.hBuf, HSlots);
             initBuffer(B.eBuf, ESlots);
             initBuffer(B.fBuf, FSlots);
             top.create<mlir::gpu::BarrierOp>(loc);
             B.inited = true;
         }
-        
+
         return bufMap.try_emplace(key, B).first->second;
       };
             
       for (auto &anchor : anchors) {
         OpBuilder b(anchor);
         auto infoOpt = buildAnchorFromConvert(anchor);
-        if (!infoOpt) continue;
+        if (!infoOpt) {
+          llvm::errs() << "[MaterializeSWSmem][WARN] Anchor pattern-match failed, skipping\n";
+          continue;
+        }
         auto info = *infoOpt;
+        llvm::errs() << "[MaterializeSWSmem][OK] Anchor matched kind=" << info.kindAttr.getValue() << " isLoad=" << info.isLoad << "\n";
 
         auto resTensorTy = llvm::dyn_cast<RankedTensorType>(info.op.getType());
         Type elemTy = resTensorTy.getElementType();
         Buffers &B = getOrCreateBuffers(elemTy);
 
-        // Choose the correct H/E/F buffer family and slot count.
-        Value buf2D;
+        // Choose the correct H/E/F flat 1D buffer and slot count.
+        Value buf1D;
         int32_t slotsCount = 0;
         StringRef kind = info.kindAttr.getValue();
-        if      (kind == "H") { buf2D = B.hBuf; slotsCount = HSlots; }
-        else if (kind == "E") { buf2D = B.eBuf; slotsCount = ESlots; }
-        else                  { buf2D = B.fBuf; slotsCount = FSlots; }
-        
-        auto slotTy1D = ttg::MemDescType::get({STRIDE}, elemTy, linearEnc1D, smem, true);
+        if      (kind == "H") { buf1D = B.hBuf; slotsCount = HSlots; }
+        else if (kind == "E") { buf1D = B.eBuf; slotsCount = ESlots; }
+        else                  { buf1D = B.fBuf; slotsCount = FSlots; }
+
         auto locA = info.op.getLoc();
-        
+
         // Recover slot/lane pointers from the original addptr pattern.
         auto addPtr = info.originalPtr.getDefiningOp<tt::AddPtrOp>();
         auto splat = addPtr.getPtr().getDefiningOp<tt::SplatOp>();
         Value scalar_base_ptr = splat.getSrc();
 
-        // [DEBUG] Print the original op and base pointer.
-        // llvm::errs() << "[MaterializeSWSmem][DEBUG] Original op: ";
-        // info.originalOp->print(llvm::errs());
-        // llvm::errs() << "\n[MaterializeSWSmem][DEBUG] scalar_base_ptr: " << scalar_base_ptr << "\n";
-
         // Slot index derivation from slotOffset.
         auto slotOffsetOpt = deriveSlotOffset(scalar_base_ptr);
         Value slotOffset = slotOffsetOpt.value_or(b.create<arith::ConstantIntOp>(locA, 0, 32));
-        // llvm::errs() << "[MaterializeSWSmem][DEBUG] Derived slotOffset: " << slotOffset << "\n";
 
         Value cStride = b.create<arith::ConstantIntOp>(locA, STRIDE, 32);
-        Value cSlots = b.create<arith::ConstantIntOp>(locA, slotsCount, 32);
+        Value cSlots  = b.create<arith::ConstantIntOp>(locA, slotsCount, 32);
         Value slotBase = b.create<arith::DivSIOp>(locA, slotOffset, cStride);
-        Value slotIdx = b.create<arith::RemSIOp>(locA, slotBase, cSlots);
-        // llvm::errs() << "[MaterializeSWSmem][DEBUG] Calculated slotIdx: " << slotIdx << "\n";
-        
+        Value slotIdx  = b.create<arith::RemSIOp>(locA, slotBase, cSlots);
+
+        // Compute flat base offset for this slot: slotIdx * STRIDE.
+        Value flatBase = b.create<arith::MulIOp>(locA, slotIdx, cStride);
+
         // Lane offsets tensor for this access.
         auto laneOffsetOpt = deriveLaneOffsetTensor(info.originalPtr);
         if (!laneOffsetOpt) {
             info.originalOp->emitError("MaterializeSWSmem requires addptr(splat(base), offset_tensor) pattern");
             return signalPassFailure();
         }
-        Value offsetTensor = *laneOffsetOpt;
+        Value laneOffsets = *laneOffsetOpt;
 
-        // Index into the correct slot: [slotIdx, *]
-        Value slot1D = b.create<ttg::MemDescIndexOp>(locA, slotTy1D, buf2D, slotIdx);
+        // Build flat offset tensor: splat(slotIdx * STRIDE) + laneOffsets.
+        Value splatFlatBase = b.create<tt::SplatOp>(locA, laneOffsets.getType(), flatBase);
+        Value flatOffsets   = b.create<arith::AddIOp>(locA, splatFlatBase, laneOffsets);
 
         if (info.isLoad) {
           // Rewrite load: local_load_slice (+ optional mask select).
-          Value result = b.create<ttg::LocalLoadSliceOp>(locA, resTensorTy, slot1D, offsetTensor);
+          Value result = b.create<ttg::LocalLoadSliceOp>(locA, resTensorTy, buf1D, flatOffsets);
           auto load = llvm::cast<tt::LoadOp>(info.originalOp);
           if (Value m = load.getMask()) {
             Value other = load.getOther();
@@ -326,13 +328,13 @@ struct MaterializeSWSmem
           // Rewrite store: optional masked update via read-modify-write.
           auto st = llvm::cast<tt::StoreOp>(info.originalOp);
           Value toStore = info.op.getSrc();
-          
+
           if (Value m = st.getMask()) {
-            Value oldVal = b.create<ttg::LocalLoadSliceOp>(locA, resTensorTy, slot1D, offsetTensor);
+            Value oldVal = b.create<ttg::LocalLoadSliceOp>(locA, resTensorTy, buf1D, flatOffsets);
             Value newVal = b.create<arith::SelectOp>(locA, m, toStore, oldVal);
-            b.create<ttg::LocalStoreSliceOp>(locA, newVal, slot1D, offsetTensor);
+            b.create<ttg::LocalStoreSliceOp>(locA, newVal, buf1D, flatOffsets);
           } else {
-            b.create<ttg::LocalStoreSliceOp>(locA, toStore, slot1D, offsetTensor);
+            b.create<ttg::LocalStoreSliceOp>(locA, toStore, buf1D, flatOffsets);
           }
           st.erase();
         }

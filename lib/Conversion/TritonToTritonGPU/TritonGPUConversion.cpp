@@ -37,6 +37,21 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
     return tensorType.cloneWithEncoding(encoding);
   });
 
+  // Convert SharedBufType → MemDescType with LinearSharedEncoding.
+  // [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+  // AllocSharedPattern replaces the op itself; this conversion handles type
+  // references that survive through SCF region arguments, function args, etc.
+  addConversion([this](triton::SharedBufType bufTy) -> triton::gpu::MemDescType {
+    auto *ctx     = bufTy.getContext();
+    Type  elemTy  = bufTy.getElemType();
+    int64_t sz    = bufTy.getSize();
+    SmallVector<unsigned> order{0};
+    auto ctaLayout = triton::gpu::CTALayoutAttr::getDefault(ctx, 1);
+    auto linearEnc = triton::gpu::LinearSharedEncodingAttr::get(ctx, order, ctaLayout);
+    auto smem      = triton::gpu::SharedMemorySpaceAttr::get(ctx);
+    return triton::gpu::MemDescType::get({sz}, elemTy, linearEnc, smem, /*mutableMem=*/true);
+  });
+
   // Add encoding for tensor pointer
   addConversion([this](triton::PointerType ptrType) -> triton::PointerType {
     // Check whether tensor pointer `tt.ptr<tensor<>>`

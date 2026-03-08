@@ -1427,5 +1427,62 @@ LogicalResult DescriptorStoreOp::verify() {
                                        getSrc().getType());
 }
 
+// ── Shared scratch-buffer ops ──────────────────────────────────────────────
+
+// AllocSharedOp: each call allocates a distinct per-block SMEM region.
+// We declare Allocate+Write so CSE cannot merge two same-size allocs.
+void AllocSharedOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects) {
+  effects.emplace_back(MemoryEffects::Allocate::get(),
+                       mlir::triton::SharedMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(),
+                       mlir::triton::SharedMemory::get());
+}
+
+// Helper: verify that `offsets` and `data` are rank-1 tensors with matching
+// shape, and that `data`'s element type matches the SharedBufType elem type.
+static LogicalResult verifySharedBufAccessTypes(Operation *op,
+                                                SharedBufType bufTy,
+                                                RankedTensorType offsetsTy,
+                                                RankedTensorType dataTy) {
+  if (offsetsTy.getRank() != 1)
+    return op->emitOpError("offsets must be a rank-1 tensor, got rank ")
+           << offsetsTy.getRank();
+  if (dataTy.getRank() != 1)
+    return op->emitOpError("data tensor must be rank-1, got rank ")
+           << dataTy.getRank();
+  if (offsetsTy.getShape()[0] != dataTy.getShape()[0])
+    return op->emitOpError("offsets shape ")
+           << offsetsTy.getShape()[0] << " != data shape "
+           << dataTy.getShape()[0];
+  if (dataTy.getElementType() != bufTy.getElemType())
+    return op->emitOpError("data element type ")
+           << dataTy.getElementType() << " does not match buffer element type "
+           << bufTy.getElemType();
+  return success();
+}
+
+LogicalResult LoadSharedOp::verify() {
+  auto bufTy     = mlir::cast<SharedBufType>(getBuf().getType());
+  auto offsetsTy = mlir::dyn_cast<RankedTensorType>(getOffsets().getType());
+  auto resultTy  = mlir::dyn_cast<RankedTensorType>(getResult().getType());
+  if (!offsetsTy)
+    return emitOpError("offsets must be a ranked tensor");
+  if (!resultTy)
+    return emitOpError("result must be a ranked tensor");
+  return verifySharedBufAccessTypes(*this, bufTy, offsetsTy, resultTy);
+}
+
+LogicalResult StoreSharedOp::verify() {
+  auto bufTy     = mlir::cast<SharedBufType>(getBuf().getType());
+  auto offsetsTy = mlir::dyn_cast<RankedTensorType>(getOffsets().getType());
+  auto valueTy   = mlir::dyn_cast<RankedTensorType>(getValue().getType());
+  if (!offsetsTy)
+    return emitOpError("offsets must be a ranked tensor");
+  if (!valueTy)
+    return emitOpError("value must be a ranked tensor");
+  return verifySharedBufAccessTypes(*this, bufTy, offsetsTy, valueTy);
+}
+
 } // namespace triton
 } // namespace mlir

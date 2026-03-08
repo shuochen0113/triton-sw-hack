@@ -1941,3 +1941,32 @@ class TritonSemantic(Generic[TensorTy]):
                                                             [s.handle for s in strides], block_shape, is_signed_int,
                                                             padding)
         return tl.tensor_descriptor(handle, shape, strides, type)
+
+    # ── Shared scratch-buffer ops ─────────────────────────────────────────────
+    # [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+
+    def alloc_shared(self, size: int, dtype: tl.dtype) -> TensorTy:
+        """Allocate `size` elements of `dtype` in shared memory for this block."""
+        elem_ir = dtype.to_ir(self.builder)
+        handle = self.builder.create_alloc_shared(size, elem_ir)
+        # Return an opaque shared_buf handle (not a tensor).
+        # Downstream passes recognise tt.alloc_shared by its result type.
+        return tl.shared_buf(handle, tl.shared_buf_type(size, dtype))
+
+    def load_shared(self, buf: TensorTy, offsets: TensorTy,
+                    mask: Optional[TensorTy], other: Optional[TensorTy]) -> TensorTy:
+        """Load elements from a shared scratch buffer at per-lane logical offsets."""
+        mask_h   = mask.handle   if mask  is not None else None
+        other_h  = other.handle  if other is not None else None
+        handle   = self.builder.create_load_shared(
+            buf.handle, offsets.handle, mask_h, other_h)
+        # Result type: rank-1 tensor of buf's elem_type, shape = offsets.shape
+        result_ty = tl.block_type(buf.type.elem_type, offsets.type.get_block_shapes())
+        return tl.tensor(handle, result_ty)
+
+    def store_shared(self, buf: TensorTy, offsets: TensorTy,
+                     value: TensorTy, mask: Optional[TensorTy]) -> None:
+        """Store elements to a shared scratch buffer at per-lane logical offsets."""
+        mask_h = mask.handle if mask is not None else None
+        self.builder.create_store_shared(
+            buf.handle, offsets.handle, value.handle, mask_h)

@@ -20,6 +20,7 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 // Interfaces
 //
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
+def SharedMemory : Resource<"::mlir::triton::SharedMemory">;
 
 //
 // Op Base
@@ -1409,6 +1410,126 @@ def TT_DescriptorScatterOp : TT_Op<"descriptor_scatter", [TT_DescriptorStoreLike
   let assemblyFormat = [{
     $desc `[` $x_offsets `,` $y_offset `]` `,` $src
     attr-dict `:` type(operands)
+  }];
+
+  let hasVerifier = 1;
+}
+
+
+//===----------------------------------------------------------------------===//
+// Explicit shared-memory scratch buffer ops
+//
+// [Context] Generalizable replacement for the sw_kernel backend hack.
+//           shuochen 2025-09 follow-up.
+//
+// These three ops form a frontend API for algorithm-agnostic SMEM promotion.
+// Unlike the original detect→promote→materialize backend pipeline, the user
+// explicitly declares the buffer and its accesses; the compiler lowers them
+// deterministically without any pattern-matching heuristics.
+//
+// [Lowering path]
+//   tt.alloc_shared  → ttg.local_alloc  (with #ttg.linear_shared encoding)
+//   tt.load_shared   → ttg.local_load_slice  (+ arith.select for mask)
+//   tt.store_shared  → ttg.local_store_slice (+ read-modify-write for mask)
+//
+// [Contract]
+//   - `size` must be a compile-time constant (constexpr in Python).
+//   - `offsets` is a 1-D integer tensor of per-lane logical offsets.
+//   - Element types must be consistent across alloc / load / store.
+//   - The SharedBuf handle is opaque: do NOT pass to tt.load / tt.store.
+//===----------------------------------------------------------------------===//
+
+def TT_AllocSharedOp : TT_Op<"alloc_shared", [
+  // NOT Pure: each call allocates a distinct per-block SMEM region.
+  // Marking Pure would allow CSE to merge two same-size allocs (e.g.,
+  // Esmem and Fsmem), making them aliases — a correctness bug.
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+  let summary = "Allocate a fixed-size per-block scratch buffer in shared memory.";
+
+  let description = [{
+    Allocates `size` elements of `elem_type` in CUDA shared memory, scoped to
+    the calling thread block.  Returns an opaque `!tt.shared_buf<size, type>`
+    handle for use by `tt.load_shared` / `tt.store_shared`.
+
+    `size` must be known at JIT compile time (constexpr).  If `size` exceeds
+    the device's available shared memory per block, the compiler will emit an
+    error during lowering.
+
+    Example:
+    ```mlir
+    %Hsmem = tt.alloc_shared<2304, i32> : !tt.shared_buf<2304, i32>
+    ```
+  }];
+
+  let arguments = (ins);  // No runtime arguments: size/type encoded in result type.
+  let results   = (outs TT_SharedBuf:$result);
+
+  let assemblyFormat = [{
+    attr-dict `:` type($result)
+  }];
+
+  // No verifier needed — type constraints are enforced by SharedBufType itself.
+}
+
+
+def TT_LoadSharedOp : TT_Op<"load_shared",
+    [AttrSizedOperandSegments,
+     MemoryEffects<[MemRead<SharedMemory>]>]> {
+  let summary = "Load a 1-D slice from a shared-memory scratch buffer.";
+
+  let description = [{
+    Loads elements from the shared scratch buffer `buf` at per-lane logical
+    `offsets`.  Semantics mirror `tt.load`: if `mask` is provided, lanes with
+    `mask == false` receive `other` (or undef if `other` is absent).
+
+    `offsets` must be a 1-D tensor of integer type; its shape determines the
+    number of lanes loading, and must match the result tensor shape.
+  }];
+
+  let arguments = (ins
+    TT_SharedBuf:$buf,
+    TT_Tensor:$offsets,
+    Optional<TT_BoolLike>:$mask,
+    Optional<TT_Type>:$other
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $buf `[` $offsets `]`
+    (`,` `mask` `=` $mask^ `:` type($mask))?
+    (`,` `other` `=` $other^ `:` type($other))?
+    attr-dict `:` qualified(type($buf)) `,` type($offsets) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+
+def TT_StoreSharedOp : TT_Op<"store_shared",
+    [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+  let summary = "Store a 1-D slice to a shared-memory scratch buffer.";
+
+  let description = [{
+    Stores `value` into the shared scratch buffer `buf` at per-lane logical
+    `offsets`.  If `mask` is provided, only lanes with `mask == true` are
+    written; other lanes leave their slot unchanged (read-modify-write).
+
+    `offsets` and `value` must be 1-D tensors of the same shape.
+  }];
+
+  let arguments = (ins
+    TT_SharedBuf:$buf,
+    TT_Tensor:$offsets,
+    TT_Tensor:$value,
+    Optional<TT_BoolLike>:$mask
+  );
+  let results = (outs);  // Store produces no SSA result.
+
+  let assemblyFormat = [{
+    $buf `[` $offsets `]` `,` $value
+    (`,` `mask` `=` $mask^ `:` type($mask))?
+    attr-dict `:` qualified(type($buf)) `,` type($offsets) `,` type($value)
   }];
 
   let hasVerifier = 1;

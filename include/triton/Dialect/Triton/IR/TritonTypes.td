@@ -92,6 +92,42 @@ def TT_TensorPtr : TT_PtrOf<[TT_Tensor]>;
 // Any Type in Triton IR
 def TT_Type : AnyTypeOf<[TT_FloatLike, TT_IntLike, TT_PtrLike, TT_TensorPtr]>;
 
+// ── Shared scratch-buffer handle (generalizable SMEM frontend API) ──────────
+//
+// [Context] shuochen 2025-09 generalizable follow-up to sw_kernel hack.
+//
+// An opaque handle representing a fixed-size scratch buffer in shared memory,
+// allocated at JIT compile-time. Unlike TT_PtrType (which uses raw address
+// arithmetic) this type is recognized by dedicated load/store ops and is
+// lowered cleanly to ttg.local_alloc + ttg.local_{load,store}_slice without
+// any pointer-backtracking heuristics.
+//
+// [Contract]
+//   - `size` is the number of elements, known at compile time (constexpr).
+//   - `elemType` is the element type (e.g. i32, f32).
+//   - The handle is not a pointer and must not be used with tt.load/tt.store.
+//   - Lifetime: function scope; each block gets its own private copy.
+def TT_SharedBufType : TritonTypeDef<"SharedBuf", "shared_buf", []> {
+  let summary = "Opaque handle to a per-block shared-memory scratch buffer";
+
+  let description = [{
+    Represents a fixed-size scratch buffer allocated in CUDA shared memory
+    at JIT compile time. Used by tt.alloc_shared / tt.load_shared /
+    tt.store_shared for algorithm-agnostic SMEM promotion.
+
+    Unlike a raw pointer, this type is opaque to alias analysis, GVN, and
+    CSE, preventing unintended transformations on SMEM accesses.
+  }];
+
+  let parameters = (ins "int64_t":$size, "Type":$elemType);
+
+  let assemblyFormat = "`<` $size `,` $elemType `>`";
+}
+
+// Convenience constraint for TableGen op arguments.
+def TT_SharedBuf : Type<CPred<"::mlir::isa<::mlir::triton::SharedBufType>($_self)">,
+                         "shared_buf", "::mlir::triton::SharedBufType">;
+
 // Result type of MakeTensorDescriptor
 def TT_TensorDescType : TritonTypeDef<"TensorDesc", "tensordesc", []> {
   let summary = "Tensor descriptor type (`::mlir::triton::TensorDescType`) in Triton IR type system";

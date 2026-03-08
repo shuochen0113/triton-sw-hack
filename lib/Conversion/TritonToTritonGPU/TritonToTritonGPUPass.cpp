@@ -540,6 +540,99 @@ public:
   }
 };
 
+// ── Shared scratch-buffer lowering patterns ───────────────────────────────
+// [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+//
+// These three patterns lower the explicit TTIR shared-buf ops to TTGIR
+// without any pattern-matching heuristics:
+//   tt.alloc_shared  → ttg.local_alloc  (with LinearSharedEncoding)
+//   tt.load_shared   → ttg.local_load_slice  (+ optional arith.select)
+//   tt.store_shared  → ttg.local_store_slice (+ optional masked RMW)
+
+struct AllocSharedPattern : public OpConversionPattern<triton::AllocSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::AllocSharedOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto *ctx  = op.getContext();
+    auto bufTy = mlir::cast<triton::SharedBufType>(op.getResult().getType());
+    Type elemTy = bufTy.getElemType();
+    int64_t sz  = bufTy.getSize();
+
+    SmallVector<unsigned> order{0};
+    auto ctaLayout = triton::gpu::CTALayoutAttr::getDefault(ctx, 1);
+    auto linearEnc = triton::gpu::LinearSharedEncodingAttr::get(ctx, order, ctaLayout);
+    auto smem      = triton::gpu::SharedMemorySpaceAttr::get(ctx);
+
+    auto memDescTy = triton::gpu::MemDescType::get(
+        {sz}, elemTy, linearEnc, smem, /*mutableMem=*/true);
+    rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(op, memDescTy);
+    return success();
+  }
+};
+
+struct LoadSharedPattern : public OpConversionPattern<triton::LoadSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::LoadSharedOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto loc      = op.getLoc();
+    Value memDesc = adaptor.getBuf();
+    Value offsets = adaptor.getOffsets();
+
+    // Use the type converter to get the TTGIR result type (with BlockedEncoding).
+    // The original TTIR resultTy has no layout encoding; all tensors in TTGIR
+    // must have an encoding attribute or later passes will crash/fail verification.
+    auto origResultTy = mlir::cast<RankedTensorType>(op.getResult().getType());
+    auto resultTy = mlir::cast<RankedTensorType>(
+        getTypeConverter()->convertType(origResultTy));
+
+    Value result = rewriter.create<triton::gpu::LocalLoadSliceOp>(
+        loc, resultTy, memDesc, offsets);
+
+    if (Value mask = adaptor.getMask()) {
+      Value other = adaptor.getOther();
+      if (!other)
+        other = rewriter.create<ub::PoisonOp>(loc, resultTy);
+      // Splat scalar 'other' to match the tensor result type for arith.select.
+      else if (!mlir::isa<RankedTensorType>(other.getType()))
+        other = rewriter.create<triton::SplatOp>(loc, resultTy, other);
+      result = rewriter.create<arith::SelectOp>(loc, mask, result, other);
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+struct StoreSharedPattern : public OpConversionPattern<triton::StoreSharedOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(triton::StoreSharedOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto loc      = op.getLoc();
+    Value memDesc = adaptor.getBuf();
+    Value offsets = adaptor.getOffsets();
+    Value value   = adaptor.getValue();
+    Value mask    = adaptor.getMask();
+
+    if (mask) {
+      // value is already the converted (TTGIR) type; use it directly.
+      auto valueTy = mlir::cast<RankedTensorType>(value.getType());
+      Value oldVal = rewriter.create<triton::gpu::LocalLoadSliceOp>(
+          loc, valueTy, memDesc, offsets);
+      Value newVal = rewriter.create<arith::SelectOp>(loc, mask, value, oldVal);
+      rewriter.create<triton::gpu::LocalStoreSliceOp>(loc, newVal, memDesc, offsets);
+    } else {
+      rewriter.create<triton::gpu::LocalStoreSliceOp>(loc, value, memDesc, offsets);
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns, unsigned numCTAs) {
   MLIRContext *context = patterns.getContext();
@@ -588,6 +681,10 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::DescriptorLoadOp>,
       GenericOpPattern<triton::DescriptorStoreOp>,
       GenericOpPattern<triton::DescriptorReduceOp>,
+      // Shared scratch-buffer ops (shuochen 2025-09 generalizable SMEM API)
+      AllocSharedPattern,
+      LoadSharedPattern,
+      StoreSharedPattern,
       // this assumes the right layout will be set later for dot scaled.
       GenericOpPattern<triton::DotScaledOp>,
       GenericOpPattern<triton::CallOp>,

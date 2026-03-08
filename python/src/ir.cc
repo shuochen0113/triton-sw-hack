@@ -1518,6 +1518,34 @@ void init_triton_ir(py::module &&m) {
               Value y_index) -> void {
              self.create<DescriptorScatterOp>(desc, x_indices, y_index, value);
            })
+      // ── Shared scratch-buffer ops ─────────────────────────────────────────
+      // [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+      .def("create_shared_buf_type",
+           [](TritonOpBuilder &self, int64_t size, Type elemTy) -> Type {
+             return triton::SharedBufType::get(self.getContext(), size, elemTy);
+           })
+      .def("create_alloc_shared",
+           [](TritonOpBuilder &self, int64_t size, Type elemTy) -> Value {
+             auto resTy = triton::SharedBufType::get(self.getContext(), size, elemTy);
+             return self.create<triton::AllocSharedOp>(resTy);
+           })
+      .def("create_load_shared",
+           [](TritonOpBuilder &self, Value buf, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other) -> Value {
+             auto bufTy   = mlir::cast<triton::SharedBufType>(buf.getType());
+             auto offsTy  = mlir::cast<RankedTensorType>(offsets.getType());
+             auto resTy   = RankedTensorType::get(offsTy.getShape(),
+                                                   bufTy.getElemType());
+             return self.create<triton::LoadSharedOp>(
+                 resTy, buf, offsets,
+                 mask.value_or(Value{}), other.value_or(Value{}));
+           })
+      .def("create_store_shared",
+           [](TritonOpBuilder &self, Value buf, Value offsets, Value value,
+              std::optional<Value> mask) -> void {
+             self.create<triton::StoreSharedOp>(
+                 buf, offsets, value, mask.value_or(Value{}));
+           })
       .def("create_reshape",
            [](TritonOpBuilder &self, Value &arg, std::vector<int64_t> &shape,
               bool allowReorder) -> Value {

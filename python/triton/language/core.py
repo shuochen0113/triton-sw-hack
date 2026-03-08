@@ -1498,6 +1498,52 @@ class tensor_descriptor(tensor_descriptor_base):
 
 
 # -----------------------
+# Shared scratch-buffer type
+# [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+# -----------------------
+
+@dataclass(frozen=True)
+class shared_buf_type(base_type):
+    """Type of an opaque shared-memory scratch buffer handle.
+
+    Not a tensor, not a pointer.  Created by :func:`allocate_shared` and
+    consumed only by :func:`load_shared` / :func:`store_shared`.
+    """
+
+    size: int       # number of elements (compile-time constant)
+    elem_type: dtype  # element dtype (e.g. tl.int32)
+
+    def to_ir(self, builder):
+        return builder.create_shared_buf_type(self.size, self.elem_type.to_ir(builder))
+
+    def mangle(self) -> str:
+        return f"smem_{self.size}x{self.elem_type.mangle()}"
+
+    def _flatten_ir_types(self, builder, out):
+        out.append(self.to_ir(builder))
+
+    def _unflatten_ir(self, handles, cursor):
+        return shared_buf(handles[cursor], self), cursor + 1
+
+
+class shared_buf(base_value):
+    """An opaque handle to a per-block shared-memory scratch buffer.
+
+    Obtained from :func:`allocate_shared`.  Pass to :func:`load_shared` or
+    :func:`store_shared` to read/write elements.  Must not be used with
+    :func:`load` or :func:`store`.
+    """
+
+    def __init__(self, handle, buf_type: shared_buf_type):
+        self.handle   = handle
+        self.type     = buf_type
+        self.dtype    = buf_type  # alias for consistency with tensor API
+
+    def _flatten_ir(self, handles):
+        handles.append(self.handle)
+
+
+# -----------------------
 # aggregate
 # -----------------------
 
@@ -2282,6 +2328,80 @@ def make_tensor_descriptor(
 
     padding_option = _unwrap_if_constexpr(padding_option)
     return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option)
+
+
+# -----------------------
+# Shared scratch-buffer API
+# [Context] Generalizable SMEM frontend API; shuochen 2025-09.
+# -----------------------
+
+@builtin
+def allocate_shared(size: constexpr, dtype: constexpr, _semantic=None) -> shared_buf:
+    """Allocate a fixed-size per-block scratch buffer in shared memory.
+
+    :param size: Number of elements to allocate (must be a compile-time
+        constant, i.e. ``constexpr``).  The buffer holds ``size`` elements of
+        ``dtype`` per thread block.
+    :param dtype: Element type of the buffer (e.g. ``tl.int32``).
+    :returns: An opaque :class:`shared_buf` handle.  Pass to
+        :func:`load_shared` / :func:`store_shared` to read/write elements.
+
+    This is the replacement for passing global-memory ring-buffer pointers as
+    kernel arguments.  Unlike a raw pointer, the returned handle is opaque to
+    alias analysis and GVN, preventing unintended transformations.
+
+    Example::
+
+        Hsmem = tl.allocate_shared(3 * STRIDE, tl.int32)  # 3-slot H ring
+        Esmem = tl.allocate_shared(2 * STRIDE, tl.int32)  # 2-slot E ring
+    """
+    size_val  = _unwrap_if_constexpr(size)
+    dtype_val = _unwrap_if_constexpr(dtype)
+    return _semantic.alloc_shared(int(size_val), dtype_val)
+
+
+@builtin
+def load_shared(buf: shared_buf, offsets, mask=None, other=None,
+                _semantic=None) -> tensor:
+    """Load elements from a shared-memory scratch buffer.
+
+    :param buf: Buffer handle returned by :func:`allocate_shared`.
+    :param offsets: 1-D integer tensor of per-lane logical offsets.
+    :param mask: Optional boolean tensor; ``False`` lanes receive ``other``.
+    :param other: Fill value for masked lanes (default: undefined).
+    :returns: 1-D tensor with the same shape as ``offsets``.
+
+    Example::
+
+        lane_off = tl.arange(0, BLOCK) + h_curr * STRIDE + band_lo
+        Hcur = tl.load_shared(Hsmem, lane_off, mask=lane_mask, other=MINF)
+    """
+    offsets = _semantic.to_tensor(offsets)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+    if other is not None:
+        other = _semantic.to_tensor(other)
+    return _semantic.load_shared(buf, offsets, mask, other)
+
+
+@builtin
+def store_shared(buf: shared_buf, offsets, value, mask=None, _semantic=None):
+    """Store elements to a shared-memory scratch buffer.
+
+    :param buf: Buffer handle returned by :func:`allocate_shared`.
+    :param offsets: 1-D integer tensor of per-lane logical offsets.
+    :param value: 1-D tensor of values to store.  Shape must match ``offsets``.
+    :param mask: Optional boolean tensor; only ``True`` lanes are written.
+
+    Example::
+
+        tl.store_shared(Hsmem, lane_off, new_H, mask=lane_mask)
+    """
+    offsets = _semantic.to_tensor(offsets)
+    value   = _semantic.to_tensor(value)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+    _semantic.store_shared(buf, offsets, value, mask)
 
 
 # -----------------------

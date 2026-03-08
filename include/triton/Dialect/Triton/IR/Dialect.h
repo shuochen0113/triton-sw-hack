@@ -28,6 +28,11 @@ struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   StringRef getName() final { return "<GlobalMemory>"; }
 };
 
+// Shared-memory resource tag for tt.load_shared / tt.store_shared effects.
+struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
+  StringRef getName() final { return "<SharedMemory>"; }
+};
+
 class DialectInferLayoutInterface
     : public DialectInterface::Base<DialectInferLayoutInterface> {
 public:
