@@ -1,3 +1,148 @@
+> **This is `triton-sw-hack` — a custom Triton compiler fork for GPU-accelerated Smith-Waterman alignment.**
+> It adds a generalized shared-memory API (`tl.allocate_shared` / `tl.load_shared` / `tl.store_shared`) and a Smith-Waterman SMEM kernel to the upstream Triton compiler. See [Triton-Seq](https://github.com/shuochen0113/Triton-Seq) for the full application stack.
+
+---
+
+# triton-sw-hack — Custom Shared-Memory API for Smith-Waterman
+
+**Branch:** `hack/smem-api-v2` (verified working on H100, 2026-03)
+**Author:** shuochen0113
+**Status:** Full-stack working — correctness verified on H100 (16,384 sequence pairs)
+
+## Design Goal
+
+Standard Triton kernels can use `tl.load` / `tl.store` for global memory, and `ttg.local_alloc` for shared memory — but only through implicitly managed shared memory (e.g., via `triton.language.tensor` with swizzled encodings). There is no first-class Python-level API to:
+
+- Explicitly allocate a per-block shared-memory scratch buffer of arbitrary size
+- Load and store individual elements (or small vectors) from it using integer offsets
+- Use non-power-of-2 strides (e.g., STRIDE=768 for a band-width-751 alignment kernel)
+
+This fork adds exactly that: a **generalized SMEM allocation API** exposed through three new Triton builtins, lowered all the way to real `ld.shared` / `st.shared` PTX instructions.
+
+The primary use-case is the Smith-Waterman / KSW2-ESTZ anti-diagonal wavefront DP kernel (OPv9), where each GPU thread block maintains H/E/F ring buffers in shared memory instead of pre-allocated global memory.
+
+---
+
+## What Was Added
+
+### New Language Primitives (`tl.*`)
+
+```python
+buf  = tl.allocate_shared(size: constexpr, dtype: constexpr) -> tl.shared_buf
+data = tl.load_shared(buf, offsets, mask=None, other=None)   -> tensor
+       tl.store_shared(buf, offsets, value, mask=None)
+```
+
+**Usage in the OPv9 kernel:**
+
+```python
+@triton.jit
+def sw_kernel_smem(..., STRIDE: tl.constexpr, BAND: tl.constexpr, BLOCK: tl.constexpr):
+    # Per-block SMEM ring buffers — no global buffer args needed
+    Hsmem = tl.allocate_shared(3 * STRIDE, tl.int32)   # 3-slot H ring
+    Esmem = tl.allocate_shared(2 * STRIDE, tl.int32)   # 2-slot E ring
+    Fsmem = tl.allocate_shared(2 * STRIDE, tl.int32)   # 2-slot F ring
+
+    # Load from ring buffer:
+    Hleft = tl.load_shared(Hsmem, slot_base + lane_off, mask=lane_mask, other=MINF)
+
+    # Store to ring buffer:
+    tl.store_shared(Hsmem, curr_slot + lane_off, H_new, mask=lane_mask)
+```
+
+### Full-Stack Implementation
+
+| Layer | What was added |
+|-------|---------------|
+| **Python frontend** (`core.py`, `semantic.py`, `__init__.py`) | `shared_buf_type`, `shared_buf`, `@builtin allocate_shared/load_shared/store_shared` |
+| **TTIR dialect** (`TritonOps.td`, `TritonTypes.td`, `Dialect.h`, `Ops.cpp`) | `!tt.shared_buf<N, T>` type; `tt.alloc_shared`, `tt.load_shared`, `tt.store_shared` ops with correct memory effects (non-Pure to prevent CSE aliasing) |
+| **TTIR→TTGIR conversion** (`TritonToTritonGPUPass.cpp`, `TritonGPUConversion.cpp`) | `AllocSharedPattern` → `ttg.local_alloc` with 1D flat `LinearSharedEncodingAttr`; `LoadSharedPattern` → `ttg.local_load_slice` + `arith.select`; `StoreSharedPattern` → `ttg.local_store_slice` |
+| **TTGIR ops** (`TritonGPUOps.td`, `lib/Dialect/TritonGPU/IR/Ops.cpp`) | `ttg.local_load_slice`, `ttg.local_store_slice` — offset-indexed slice access into a flat 1D MemDesc |
+| **LLVM lowering** (`MemoryOpToLLVM.cpp`) | `LocalLoadSliceOpConversion` / `LocalStoreSliceOpConversion` → `ld.shared.b32` / `st.shared.b32` PTX |
+| **C++ pybind** (`python/src/ir.cc`) | `create_alloc_shared`, `create_load_shared`, `create_store_shared` |
+
+### Key Design Decisions
+
+**1. Non-power-of-2 STRIDE support**
+`MemDescType::verify` checks that all dims except the first are powers of 2. By using a 1D flat `[N]` shape for the MemDesc (rather than a 2D `[slots, stride]`), the `drop_front(1)` check is vacuously empty — so STRIDE=768, 192, etc. all work.
+
+**2. Non-Pure `TT_AllocSharedOp`**
+If `TT_AllocSharedOp` were marked `[Pure]`, MLIR’s CSE pass would merge two same-size allocations (e.g. `Esmem` and `Fsmem` both `!tt.shared_buf<1536, i32>`) into one, causing aliasing and incorrect results. The op is instead declared with `Allocate + Write` memory effects so CSE treats each call as distinct.
+
+**3. `shared_buf_type._unflatten_ir` must return `shared_buf`**
+Triton’s JIT for-loop compiler clones loop-body scopes by calling `_unflatten_ir` on every live value’s type. If `_unflatten_ir` returns a raw `ir.value` instead of a `shared_buf` wrapper, the cloned handle loses its `.handle` attribute and causes a `’ir.value’ has no attribute ‘handle’` error on the first loop iteration.
+
+**4. BlockedEncodingAttr on load result**
+`LoadSharedPattern` must call `getTypeConverter()->convertType(origResultTy)` to obtain the TTGIR tensor type with `BlockedEncodingAttr`. Using the raw TTIR type (no encoding) causes downstream pass verification failures.
+
+### V1 Hack (Legacy Path)
+
+An earlier, V1 approach uses three automatic MLIR passes (`SeqAlignDetect` → `PromoteSeqAlignToShared` → `MaterializeSWSmem`) to auto-promote global H/E/F ring-buffer accesses in the original `sw_kernel` to shared memory. `MaterializeSWSmem.cpp` is kept in this fork for reference. **It is hardcoded to STRIDE=768, BLOCK=256** and only handles `@sw_kernel` specifically — the V2 generalized API (above) supersedes it. The original V1 design doc is preserved below.
+
+---
+
+## Verification Results (H100 80GB, CUDA 13.1)
+
+### Correctness
+All `(score, best_i, best_j)` tuples for 16,384 real sequence pairs match the global-memory OPv6 baseline exactly.
+
+### Arbitrary BAND/STRIDE Robustness
+| Config | OPv9 SMEM | OPv6 Global | Match |
+|--------|-----------|-------------|-------|
+| BAND=127, STRIDE=128 | ✓ | ✓ | ✓ |
+| BAND=251, STRIDE=256 | ✓ | ✓ | ✓ |
+| BAND=501, STRIDE=512 | ✓ | ✓ | ✓ |
+| BAND=751, STRIDE=768 | ✓ | ✓ | ✓ |
+| BAND=1023, STRIDE=1024 | ✓ | ✓ | ✓ |
+| BAND=51, STRIDE=64 | Rejected (STRIDE < BLOCK=256) | — | Expected |
+
+**Constraint:** `STRIDE ≥ BLOCK` (enforced by `LocalLoadSliceOp` verifier).
+
+### Performance (122.6 GCells, BAND=751)
+| Kernel | Time | Throughput |
+|--------|------|------------|
+| OPv6 (global mem, L2-cached) | 97.4 ms | 1260 GCUPS |
+| OPv9 (SMEM, tl.allocate_shared) | 99.6 ms | 1232 GCUPS |
+
+Performance parity (~0.98×) is expected: at this sequence length and batch size, OPv6’s ring buffers (21 KB/block) stay resident in H100 L2 cache, providing similar effective bandwidth to SMEM. **OPv9 eliminates ~344 MB of pre-allocated global ring-buffer memory.**
+
+### PTX Evidence
+```
+.extern .shared .align 16 .b8 global_smem[];
+ld.shared.b32   %r133, [%r132];          // H ring read (main loop)
+st.shared.b32   [%r266], %r272;          // H ring write (main loop)
+ld.shared.b32   %r214, [%r213+9216];     // E ring read (base = 2304*4 bytes)
+st.shared.b32   [%r251+15360], %r261;    // F ring write (base = 3840*4 bytes)
+```
+Real `ld.shared`/`st.shared` confirmed: 20 loads, 52 stores (42 init + 10 main loop).
+
+---
+
+## Modified Files (relative to upstream Triton)
+
+| File | Change |
+|------|--------|
+| `include/triton/Dialect/Triton/IR/TritonTypes.td` | `TT_SharedBufType` |
+| `include/triton/Dialect/Triton/IR/TritonOps.td` | `TT_AllocSharedOp`, `TT_LoadSharedOp`, `TT_StoreSharedOp`; `SharedMemory` resource |
+| `include/triton/Dialect/Triton/IR/Dialect.h` | `struct SharedMemory` in `mlir::triton` namespace |
+| `include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td` | `TTG_LocalLoadSliceOp`, `TTG_LocalStoreSliceOp` |
+| `lib/Dialect/Triton/IR/Ops.cpp` | `AllocSharedOp::getEffects`, verifiers |
+| `lib/Dialect/TritonGPU/IR/Ops.cpp` | Slice op verifiers and effects |
+| `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp` | `AllocSharedPattern`, `LoadSharedPattern`, `StoreSharedPattern` |
+| `lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp` | `SharedBufType → MemDescType` type conversion |
+| `lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp` | `LocalLoadSliceOpConversion`, `LocalStoreSliceOpConversion` |
+| `lib/Dialect/TritonGPU/Transforms/MaterializeSWSmem.cpp` | V1 hack (legacy, kept for reference) |
+| `python/src/ir.cc` | `create_alloc_shared`, `create_load_shared`, `create_store_shared` pybind |
+| `python/triton/language/core.py` | `shared_buf_type`, `shared_buf`, builtins |
+| `python/triton/language/semantic.py` | `alloc_shared`, `load_shared`, `store_shared` |
+| `python/triton/language/__init__.py` | Exports |
+
+Full implementation details: [`docs/smem-api/SMEM_GENERALIZED_API.md`](docs/smem-api/SMEM_GENERALIZED_API.md)
+
+---
+
+# V1 Design Doc (Legacy Reference)
+
 # SW Kernel - Compiler Extensions for Triton (Shared Memory Materialization)
 **Shuochen’s hack for `sw_kernel` v1 - 2025/09/10**
 
