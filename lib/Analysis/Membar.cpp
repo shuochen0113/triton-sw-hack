@@ -9,6 +9,15 @@
 
 namespace mlir {
 
+namespace {
+
+bool isExplicitSharedSliceOp(Operation *op) {
+  return isa<triton::gpu::LocalLoadSliceOp, triton::gpu::LocalStoreSliceOp>(
+      op);
+}
+
+} // namespace
+
 void MembarOrFenceAnalysis::run(FuncBlockInfoMapT &funcBlockInfoMap) {
   FunctionOpInterface funcOp =
       dyn_cast<FunctionOpInterface>(allocation->getOperation());
@@ -180,6 +189,14 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     blockInfo->sync();
     return;
   }
+
+  // `ttg.local_load_slice` / `ttg.local_store_slice` are explicit shared-memory
+  // primitives. Their synchronization is intentionally controlled by explicit
+  // barriers in the IR, not by the generic membar analysis, which only knows
+  // whole-buffer intervals and otherwise inserts barriers between nearly every
+  // access to the same memdesc.
+  if (isExplicitSharedSliceOp(op))
+    return;
 
   BlockInfo curBlockInfo;
   auto scratchBufferId = Allocation::InvalidBufferId;

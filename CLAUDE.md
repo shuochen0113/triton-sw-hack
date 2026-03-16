@@ -8,7 +8,7 @@ A fork of [triton-lang/triton](https://github.com/triton-lang/triton) that adds 
 generalized shared-memory (SMEM) allocation API for use in the Triton-Seq
 Smith-Waterman kernel project.
 
-**Active branch:** `hack/smem-api-v2` (verified working on H100, 2026-03)
+**Active branch:** `hack/smem-api-v2`
 **Application repo:** [Triton-Seq](https://github.com/shuochen0113/Triton-Seq)
 
 ## Critical Rules
@@ -43,6 +43,7 @@ data = tl.load_shared(buf, offsets, mask=None, other=None)
 | `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp` | `AllocSharedPattern`, `LoadSharedPattern`, `StoreSharedPattern` |
 | `lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp` | `SharedBufType → MemDescType` type conversion |
 | `lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp` | `LocalLoadSliceOpConversion`, `LocalStoreSliceOpConversion` |
+| `lib/Analysis/Membar.cpp` | bypass generic membar insertion for explicit local slice ops |
 | `lib/Dialect/TritonGPU/Transforms/MaterializeSWSmem.cpp` | V1 legacy auto-promotion pass (kept for reference) |
 | `python/src/ir.cc` | `create_alloc_shared/load_shared/store_shared` pybind bindings |
 | `python/triton/language/core.py` | `shared_buf_type`, `shared_buf`, `@builtin` functions |
@@ -50,6 +51,42 @@ data = tl.load_shared(buf, offsets, mask=None, other=None)
 | `python/triton/language/__init__.py` | Exports for all new symbols |
 
 Full implementation details: `docs/smem-api/SMEM_GENERALIZED_API.md`
+
+## Latest Known State (March 16, 2026)
+
+### Measured on A6000
+
+- **Upstream OPv6:** `303.13 ms`, `404.80 GCUPS`
+- **Hack-v2 OPv9:** `147.49 ms`, `832.74 GCUPS`
+- **Hack-v2 OPv9 PTX stats:** `ld_shared=14`, `st_shared=52`, `ld_global=8`, `st_global=3`, `bar_sync=7`
+
+### Manual PTX target
+
+From `Triton-Seq/experiments/ptx_modification/ptx/hacked_HEF.ptx`:
+
+- `ld_shared=14`
+- `st_shared=14`
+- `ld_global=8`
+- `st_global=3`
+- `bar_sync=7`
+
+### Interpretation
+
+- The generalized SMEM API is working correctly end-to-end.
+- The masked-store and membar fixes already worked:
+  - `ld_shared` now matches the manual PTX target
+  - `bar_sync` now matches the manual PTX target
+- The remaining issue is **too many static `st.shared` sites**, mostly from
+  shared-buffer initialization shape rather than the DP recurrence itself.
+
+### Important: measured vs implemented
+
+The latest A6000 benchmark artifacts were collected **before** the newest
+init-compaction patches were rebuilt. These patches are now in tree but still
+need a rebuild/rerun to verify:
+
+- `lib/Dialect/TritonGPU/Transforms/MaterializeSWSmem.cpp`
+- `Triton-Seq/src/kernel/experimental/local_dp_kernel_OPv9_smem.py`
 
 ## Known Gotchas
 
@@ -73,6 +110,25 @@ Full implementation details: `docs/smem-api/SMEM_GENERALIZED_API.md`
    Enforced by `LocalLoadSliceOp::verify`.  Configurations with STRIDE < BLOCK are
    correctly rejected.
 
+6. **`ttg.local_store_slice` now carries an optional mask**
+   Masked stores must lower to predicated `st.shared`, not to a read-modify-write
+   sequence. Relevant files:
+   - `include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td`
+   - `lib/Dialect/TritonGPU/IR/Ops.cpp`
+   - `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp`
+   - `lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp`
+
+7. **Explicit local slice ops bypass generic membar insertion**
+   `lib/Analysis/Membar.cpp` now treats `ttg.local_load_slice` /
+   `ttg.local_store_slice` as explicit shared-memory primitives. If barriers
+   suddenly come back, inspect this file first.
+
+8. **The remaining `st.shared` inflation is mostly init shape**
+   If the next rerun still shows too many static stores, inspect whether the new
+   strip-mined runtime fill loops were preserved or unrolled away. The next likely
+   step would be a dedicated `tl.fill_shared` / TTIR op if source-level strip-mining
+   is still not compact enough.
+
 ## Branch History
 
 | Branch | Description |
@@ -94,6 +150,11 @@ python -c "import triton.language as tl; print(tl.allocate_shared)"
 
 # Run OPv9 correctness test (from Triton-Seq root)
 python benchmarks/scripts/test_opv9_correctness.py
+
+# Run latest compiler experiment (from Triton-Seq root)
+python benchmarks/scripts/experiment_triton_compiler.py \
+  --compiler-label hack-v2 \
+  --kernel opv9
 ```
 
 ## Git Workflow for This Submodule

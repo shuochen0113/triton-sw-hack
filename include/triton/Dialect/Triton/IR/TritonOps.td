@@ -1430,7 +1430,7 @@ def TT_DescriptorScatterOp : TT_Op<"descriptor_scatter", [TT_DescriptorStoreLike
 // [Lowering path]
 //   tt.alloc_shared  → ttg.local_alloc  (with #ttg.linear_shared encoding)
 //   tt.load_shared   → ttg.local_load_slice  (+ arith.select for mask)
-//   tt.store_shared  → ttg.local_store_slice (+ read-modify-write for mask)
+//   tt.store_shared  → ttg.local_store_slice (+ predicated store for mask)
 //
 // [Contract]
 //   - `size` must be a compile-time constant (constexpr in Python).
@@ -1513,7 +1513,7 @@ def TT_StoreSharedOp : TT_Op<"store_shared",
   let description = [{
     Stores `value` into the shared scratch buffer `buf` at per-lane logical
     `offsets`.  If `mask` is provided, only lanes with `mask == true` are
-    written; other lanes leave their slot unchanged (read-modify-write).
+    written; other lanes leave their slot unchanged.
 
     `offsets` and `value` must be 1-D tensors of the same shape.
   }];

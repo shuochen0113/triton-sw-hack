@@ -1331,6 +1331,9 @@ LogicalResult LocalStoreSliceOp::verify() {
   auto srcDataTy = dyn_cast<RankedTensorType>(getSrc().getType());
   auto mdTy = dyn_cast<MemDescType>(getDst().getType());
   auto offsetTy = dyn_cast<RankedTensorType>(getOffset().getType());
+  RankedTensorType maskTy;
+  if (Value mask = getMask())
+    maskTy = dyn_cast<RankedTensorType>(mask.getType());
 
   if (!mdTy || !srcDataTy || !offsetTy) {
     return op->emitOpError("operands must be valid descriptor and tensor types");
@@ -1361,6 +1364,17 @@ LogicalResult LocalStoreSliceOp::verify() {
   // [Contract] Offsets are integer-typed indices.
   if (!isa<IntegerType>(offsetTy.getElementType())) {
       return op->emitOpError("offset tensor must have an integer element type");
+  }
+  if (getMask()) {
+    if (!maskTy || maskTy.getRank() != 1) {
+      return op->emitOpError("mask tensor must be rank-1");
+    }
+    if (maskTy.getShape() != srcDataTy.getShape()) {
+      return op->emitOpError("shape mismatch between source tensor and mask tensor");
+    }
+    if (!maskTy.getElementType().isInteger(1)) {
+      return op->emitOpError("mask tensor must have i1 element type");
+    }
   }
 
   return success();

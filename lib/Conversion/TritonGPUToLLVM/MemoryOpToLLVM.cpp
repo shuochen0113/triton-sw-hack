@@ -237,6 +237,7 @@ private:
 // Lowering Pattern for ttg.local_load_slice
 // [Context] Shuochen’s hack for sw_kernel v1 — 2025/09/10
 // [MODIFIED: 2025/09/10 - Correctness Fix]
+// [MODIFIED: 2026/03/16 - Predicated masked stores]
 //
 // [Purpose]
 //   Deterministic SMEM load lowering. This pattern consumes the preserved
@@ -340,15 +341,14 @@ private:
 // [MODIFIED: 2025/09/10 - Correctness Fix]
 //
 // [Purpose]
-//   Deterministic SMEM store lowering symmetrical to local_load_slice.
+//   Deterministic SMEM store lowering symmetrical to local_load_slice, while
+//   preserving masked stores as predicated `st.shared` operations.
 //
 // [Invariants]
 //   - Implements "address clamping" for the same safety reasons as the load
 //     pattern. If an offset is out of bounds, the store is redirected to a safe
-//     address (offset 0). Since masked stores are implemented as RMW,
-//     this garbage store is harmless: the original value at offset 0 is read,
-//     and then immediately written back, resulting in no net change. This
-//     prevents crashes while preserving correctness.
+//     address (offset 0) and predicated off. This prevents crashes while
+//     preserving correctness.
 //
 // [Lowering Steps]
 //   1) Guard on #ttg.linear_shared encoding.
@@ -356,7 +356,7 @@ private:
 //   3) Unpack source values and offsets into per-lane scalars.
 //   4) For each lane, check if `0 <= logical_offset < bound`.
 //   5) Select `safe_offset = in_bounds ? logical_offset : 0`.
-//   6) Emit GEP(base, safe_offset) + Store.
+//   6) Emit GEP(base, safe_offset) + predicated st.shared.
 //   7) Erase the op.
 // ============================================================================
 
@@ -378,7 +378,7 @@ public:
     auto srcDataTy = cast<RankedTensorType>(op.getSrc().getType());
     auto memDescTy = cast<triton::gpu::MemDescType>(op.getDst().getType());
     auto offsetTy = cast<RankedTensorType>(op.getOffset().getType());
-    
+
     // 1. Guard: This pattern only matches our custom linear encoding.
     auto linearSharedEnc = dyn_cast<triton::gpu::LinearSharedEncodingAttr>(memDescTy.getEncoding());
     if (!linearSharedEnc)
@@ -395,7 +395,10 @@ public:
     // --- Unpack both the data tensor and the offset tensor ---
     auto valsToStore = unpackLLElements(loc, adaptor.getSrc(), rewriter);
     auto logicalOffsets = unpackLLElements(loc, adaptor.getOffset(), rewriter);
-    
+    SmallVector<Value> maskVals;
+    if (adaptor.getMask())
+      maskVals = unpackLLElements(loc, adaptor.getMask(), rewriter);
+
     // --- Create constants for boundary checks ---
     Value cZero = b.i32_val(0);
     Value cWrapBound = b.i32_val(wrapBound);
@@ -410,11 +413,15 @@ public:
       
       //    If the offset is out of bounds, use a safe offset (0).
       Value safePhysicalOffset = rewriter.create<arith::SelectOp>(loc, predInBounds, logicalOffset, cZero);
+      Value pred = predInBounds;
+      if (adaptor.getMask())
+        pred = rewriter.create<arith::AndIOp>(loc, pred, maskVals[i]);
 
-      // 3. Generate GEP + Store using the GUARANTEED-TO-BE-SAFE physical offset.
+      // 3. Generate GEP + predicated shared store using the guaranteed-safe
+      //    physical offset.
       Value ptr = rewriter.create<LLVM::GEPOp>(
           loc, smemBase.getType(), llvmElemTy, smemBase, ValueRange{safePhysicalOffset});
-      rewriter.create<LLVM::StoreOp>(loc, valsToStore[i], ptr);
+      targetInfo.storeShared(rewriter, loc, ptr, valsToStore[i], pred);
     }
 
     rewriter.eraseOp(op);

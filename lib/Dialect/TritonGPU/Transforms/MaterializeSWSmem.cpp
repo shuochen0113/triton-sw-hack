@@ -60,6 +60,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Casting.h"
@@ -165,7 +166,6 @@ struct MaterializeSWSmem
     // [Design] Tuning constants for current SW kernel variant.
     const int64_t STRIDE = 768;
     const int64_t BLOCK  = 256;
-    const int64_t SEGS   = STRIDE / BLOCK;
     const int64_t HSlots = 3, ESlots = 2, FSlots = 2;
 
     module.walk([&](tt::FuncOp func) {
@@ -236,20 +236,46 @@ struct MaterializeSWSmem
             auto initTy256 = RankedTensorType::get({BLOCK}, elemTy, blockedEnc256);
 
             Value vMINF = top.create<tt::SplatOp>(loc, initTy256, cMINF);
+            Value makeRange = top.create<tt::MakeRangeOp>(loc, initTy256, 0, BLOCK);
+            Value c0 = top.create<arith::ConstantIntOp>(loc, 0, 32);
+            Value cBlock = top.create<arith::ConstantIntOp>(loc, BLOCK, 32);
 
-            // [Fix] No MemDescIndexOp: compute flat offsets directly.
-            // For slot s, segment g: flat base = s*STRIDE + g*BLOCK.
+            // Strip-mine the initialization in a runtime while-loop so the
+            // backend keeps a compact loop body instead of unrolling one
+            // static local_store_slice per BLOCK-sized chunk.
             auto initBuffer = [&](Value buf1D, int numSlots) {
-                for (int s = 0; s < numSlots; ++s) {
-                    for (int g = 0; g < SEGS; ++g) {
-                        int64_t flatBase = (int64_t)s * STRIDE + (int64_t)g * BLOCK;
-                        Value segOffset = top.create<arith::ConstantIntOp>(loc, flatBase, 32);
-                        Value splatSegOffset = top.create<tt::SplatOp>(loc, initTy256, segOffset);
-                        Value makeRange = top.create<tt::MakeRangeOp>(loc, initTy256, 0, BLOCK);
-                        Value offsetTensor = top.create<arith::AddIOp>(loc, splatSegOffset, makeRange);
-                        top.create<ttg::LocalStoreSliceOp>(loc, vMINF, buf1D, offsetTensor);
-                    }
-                }
+                Value limit = top.create<arith::ConstantIntOp>(loc,
+                                                               numSlots * STRIDE,
+                                                               32);
+                auto whileOp = top.create<scf::WhileOp>(loc, TypeRange{c0.getType()},
+                                                        ValueRange{c0});
+
+                Block *before =
+                    top.createBlock(&whileOp.getBefore(), whileOp.getBefore().begin(),
+                                    TypeRange{c0.getType()}, SmallVector<Location>{loc});
+                OpBuilder beforeBuilder = OpBuilder::atBlockEnd(before);
+                Value beforeBase = before->getArgument(0);
+                Value beforeCond = beforeBuilder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::slt, beforeBase, limit);
+                beforeBuilder.create<scf::ConditionOp>(loc, beforeCond,
+                                                       ValueRange{beforeBase});
+
+                Block *after =
+                    top.createBlock(&whileOp.getAfter(), whileOp.getAfter().begin(),
+                                    TypeRange{c0.getType()}, SmallVector<Location>{loc});
+                OpBuilder bodyBuilder = OpBuilder::atBlockEnd(after);
+                Value base = after->getArgument(0);
+                Value splatBase = bodyBuilder.create<tt::SplatOp>(loc, initTy256, base);
+                Value offsetTensor =
+                    bodyBuilder.create<arith::AddIOp>(loc, makeRange, splatBase);
+                Value splatLimit = bodyBuilder.create<tt::SplatOp>(loc, initTy256, limit);
+                Value mask = bodyBuilder.create<arith::CmpIOp>(
+                    loc, arith::CmpIPredicate::slt, offsetTensor, splatLimit);
+                bodyBuilder.create<ttg::LocalStoreSliceOp>(loc, vMINF, buf1D,
+                                                           offsetTensor, mask);
+                Value nextBase =
+                    bodyBuilder.create<arith::AddIOp>(loc, base, cBlock);
+                bodyBuilder.create<scf::YieldOp>(loc, ValueRange{nextBase});
             };
 
             initBuffer(B.hBuf, HSlots);
@@ -325,17 +351,12 @@ struct MaterializeSWSmem
           }
           info.op.replaceAllUsesWith(result);
         } else {
-          // Rewrite store: optional masked update via read-modify-write.
+          // Rewrite store: preserve the lane mask for predicated shared-store
+          // lowering instead of synthesizing a read-modify-write sequence.
           auto st = llvm::cast<tt::StoreOp>(info.originalOp);
           Value toStore = info.op.getSrc();
-
-          if (Value m = st.getMask()) {
-            Value oldVal = b.create<ttg::LocalLoadSliceOp>(locA, resTensorTy, buf1D, flatOffsets);
-            Value newVal = b.create<arith::SelectOp>(locA, m, toStore, oldVal);
-            b.create<ttg::LocalStoreSliceOp>(locA, newVal, buf1D, flatOffsets);
-          } else {
-            b.create<ttg::LocalStoreSliceOp>(locA, toStore, buf1D, flatOffsets);
-          }
+          b.create<ttg::LocalStoreSliceOp>(locA, toStore, buf1D, flatOffsets,
+                                           st.getMask());
           st.erase();
         }
         info.op.erase();

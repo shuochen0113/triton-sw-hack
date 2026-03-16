@@ -634,7 +634,9 @@ def TTG_LocalLoadSliceOp : TTG_Op<"local_load_slice", [
 
 
 def TTG_LocalStoreSliceOp : TTG_Op<"local_store_slice", [
-  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+  OptionalTypesMatchWith<"infer mask type from src type",
+                 "src", "mask", "getI1SameShape($_self)">
 ]> {
   let summary = "Store a slice to a 1D shared memdesc using a dynamic offset tensor.";
 
@@ -645,13 +647,17 @@ def TTG_LocalStoreSliceOp : TTG_Op<"local_store_slice", [
     // [Contract] Destination MemDesc in #triton_gpu.shared; must be mutable.
     TTG_MemDescType:$dst,
     // [Contract] Per-thread logical offsets; rank-1; shape matches `src`.
-    TT_Tensor:$offset
+    TT_Tensor:$offset,
+    // [Contract] Optional per-lane predicate; shape matches `src`.
+    Optional<I1Tensor>:$mask
   );
   let results = (outs);
 
   // [Diagnostics] Symmetric with load; keeps IR succinct.
   let assemblyFormat = [{
-    $src `,` $dst `,` $offset attr-dict `:` type($src) `,` qualified(type($dst)) `,` type($offset)
+    $src `,` $dst `,` $offset
+    (`,` `mask` `=` $mask^ `:` type($mask))?
+    attr-dict `:` type($src) `,` qualified(type($dst)) `,` type($offset)
   }];
 
   // [Contract] Enforce space/mutability/shape/type checks in the verifier.

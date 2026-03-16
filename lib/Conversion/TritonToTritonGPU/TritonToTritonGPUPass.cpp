@@ -547,7 +547,7 @@ public:
 // without any pattern-matching heuristics:
 //   tt.alloc_shared  → ttg.local_alloc  (with LinearSharedEncoding)
 //   tt.load_shared   → ttg.local_load_slice  (+ optional arith.select)
-//   tt.store_shared  → ttg.local_store_slice (+ optional masked RMW)
+//   tt.store_shared  → ttg.local_store_slice (+ optional predicated store)
 
 struct AllocSharedPattern : public OpConversionPattern<triton::AllocSharedOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -618,16 +618,8 @@ struct StoreSharedPattern : public OpConversionPattern<triton::StoreSharedOp> {
     Value value   = adaptor.getValue();
     Value mask    = adaptor.getMask();
 
-    if (mask) {
-      // value is already the converted (TTGIR) type; use it directly.
-      auto valueTy = mlir::cast<RankedTensorType>(value.getType());
-      Value oldVal = rewriter.create<triton::gpu::LocalLoadSliceOp>(
-          loc, valueTy, memDesc, offsets);
-      Value newVal = rewriter.create<arith::SelectOp>(loc, mask, value, oldVal);
-      rewriter.create<triton::gpu::LocalStoreSliceOp>(loc, newVal, memDesc, offsets);
-    } else {
-      rewriter.create<triton::gpu::LocalStoreSliceOp>(loc, value, memDesc, offsets);
-    }
+    rewriter.create<triton::gpu::LocalStoreSliceOp>(loc, value, memDesc,
+                                                    offsets, mask);
     rewriter.eraseOp(op);
     return success();
   }

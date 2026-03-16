@@ -5,9 +5,11 @@
 
 # triton-sw-hack — Custom Shared-Memory API for Smith-Waterman
 
-**Branch:** `hack/smem-api-v2` (verified working on H100, 2026-03)
-**Author:** shuochen0113
-**Status:** Full-stack working — correctness verified on H100 (16,384 sequence pairs)
+**Branch:** `hack/smem-api-v2` (active; latest A6000 investigation: March 16, 2026)
+**Author:** Shuochen
+**Status:** Full-stack working. Shared-memory allocation/load/store is correct and
+benchmarked; the remaining open issue is compacting initialization so the final
+PTX store count gets closer to the manual hacked PTX.
 
 ## Design Goal
 
@@ -20,6 +22,40 @@ Standard Triton kernels can use `tl.load` / `tl.store` for global memory, and `t
 This fork adds exactly that: a **generalized SMEM allocation API** exposed through three new Triton builtins, lowered all the way to real `ld.shared` / `st.shared` PTX instructions.
 
 The primary use-case is the Smith-Waterman / KSW2-ESTZ anti-diagonal wavefront DP kernel (OPv9), where each GPU thread block maintains H/E/F ring buffers in shared memory instead of pre-allocated global memory.
+
+---
+
+## Latest Status (A6000, March 16, 2026)
+
+The newest compiler comparison runs in Triton-Seq show:
+
+| Run | Time | Throughput | Static PTX profile |
+|-----|------|------------|--------------------|
+| Upstream OPv6 | `303.13 ms` | `404.80 GCUPS` | `ld_shared=4`, `st_shared=4`, `ld_global=18`, `st_global=9`, `bar_sync=6` |
+| Hack-v2 OPv9 | `147.49 ms` | `832.74 GCUPS` | `ld_shared=14`, `st_shared=52`, `ld_global=8`, `st_global=3`, `bar_sync=7` |
+
+This means:
+
+- the V2 SMEM path is clearly working and materially faster on A6000
+- the March 16 compiler fixes for **masked stores** and **membar insertion**
+  already worked, because `ld_shared` and `bar_sync` now match the manual PTX target
+- the remaining mismatch is `st_shared=52`, which analysis traced mostly to
+  **initialization code shape**
+
+The manual PTX target in `experiments/ptx_modification/ptx/hacked_HEF.ptx`
+still has the best reference profile:
+
+- `ld_shared=14`
+- `st_shared=14`
+- `ld_global=8`
+- `st_global=3`
+- `bar_sync=7`
+
+Important: the newest init-compaction patches were added **after** the A6000
+measurement above. Those patches still need a rebuild and rerun:
+
+- Triton-Seq OPv9 source now uses strip-mined runtime fill loops for H/E/F init
+- `MaterializeSWSmem.cpp` now uses the same runtime-fill shape for the V1 path
 
 ---
 
@@ -56,9 +92,9 @@ def sw_kernel_smem(..., STRIDE: tl.constexpr, BAND: tl.constexpr, BLOCK: tl.cons
 |-------|---------------|
 | **Python frontend** (`core.py`, `semantic.py`, `__init__.py`) | `shared_buf_type`, `shared_buf`, `@builtin allocate_shared/load_shared/store_shared` |
 | **TTIR dialect** (`TritonOps.td`, `TritonTypes.td`, `Dialect.h`, `Ops.cpp`) | `!tt.shared_buf<N, T>` type; `tt.alloc_shared`, `tt.load_shared`, `tt.store_shared` ops with correct memory effects (non-Pure to prevent CSE aliasing) |
-| **TTIR→TTGIR conversion** (`TritonToTritonGPUPass.cpp`, `TritonGPUConversion.cpp`) | `AllocSharedPattern` → `ttg.local_alloc` with 1D flat `LinearSharedEncodingAttr`; `LoadSharedPattern` → `ttg.local_load_slice` + `arith.select`; `StoreSharedPattern` → `ttg.local_store_slice` |
+| **TTIR→TTGIR conversion** (`TritonToTritonGPUPass.cpp`, `TritonGPUConversion.cpp`) | `AllocSharedPattern` → `ttg.local_alloc` with 1D flat `LinearSharedEncodingAttr`; `LoadSharedPattern` → `ttg.local_load_slice` + `arith.select`; `StoreSharedPattern` → `ttg.local_store_slice` with optional mask |
 | **TTGIR ops** (`TritonGPUOps.td`, `lib/Dialect/TritonGPU/IR/Ops.cpp`) | `ttg.local_load_slice`, `ttg.local_store_slice` — offset-indexed slice access into a flat 1D MemDesc |
-| **LLVM lowering** (`MemoryOpToLLVM.cpp`) | `LocalLoadSliceOpConversion` / `LocalStoreSliceOpConversion` → `ld.shared.b32` / `st.shared.b32` PTX |
+| **LLVM lowering** (`MemoryOpToLLVM.cpp`) | `LocalLoadSliceOpConversion` / `LocalStoreSliceOpConversion` → `ld.shared.b32` / predicated `st.shared.b32` PTX |
 | **C++ pybind** (`python/src/ir.cc`) | `create_alloc_shared`, `create_load_shared`, `create_store_shared` |
 
 ### Key Design Decisions
@@ -74,6 +110,18 @@ Triton’s JIT for-loop compiler clones loop-body scopes by calling `_unflatten_
 
 **4. BlockedEncodingAttr on load result**
 `LoadSharedPattern` must call `getTypeConverter()->convertType(origResultTy)` to obtain the TTGIR tensor type with `BlockedEncodingAttr`. Using the raw TTIR type (no encoding) causes downstream pass verification failures.
+
+**5. Masked shared stores must remain stores**
+`StoreSharedPattern` and `MaterializeSWSmem` originally lowered masked shared
+stores through a read-modify-write sequence. `ttg.local_store_slice` now carries
+an optional mask and lowers directly to predicated `st.shared`, removing the old
+`ld.shared + selp + st.shared` shape.
+
+**6. Explicit shared slice ops must bypass generic membar**
+`ttg.local_load_slice` / `ttg.local_store_slice` represent explicit shared-memory
+ scheduling. Generic whole-buffer membar insertion was adding many unnecessary
+ `bar.sync` instructions; `lib/Analysis/Membar.cpp` now skips that automatic path
+ for these ops.
 
 ### V1 Hack (Legacy Path)
 
@@ -114,7 +162,9 @@ st.shared.b32   [%r266], %r272;          // H ring write (main loop)
 ld.shared.b32   %r214, [%r213+9216];     // E ring read (base = 2304*4 bytes)
 st.shared.b32   [%r251+15360], %r261;    // F ring write (base = 3840*4 bytes)
 ```
-Real `ld.shared`/`st.shared` confirmed: 20 loads, 52 stores (42 init + 10 main loop).
+Real `ld.shared`/`st.shared` are confirmed. In the latest A6000 benchmark the
+static profile is `14` shared loads and `52` shared stores. The remaining store
+excess is mostly initialization, not the core DP recurrence.
 
 ---
 
@@ -131,6 +181,7 @@ Real `ld.shared`/`st.shared` confirmed: 20 loads, 52 stores (42 init + 10 main l
 | `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp` | `AllocSharedPattern`, `LoadSharedPattern`, `StoreSharedPattern` |
 | `lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp` | `SharedBufType → MemDescType` type conversion |
 | `lib/Conversion/TritonGPUToLLVM/MemoryOpToLLVM.cpp` | `LocalLoadSliceOpConversion`, `LocalStoreSliceOpConversion` |
+| `lib/Analysis/Membar.cpp` | skip generic membar insertion for explicit local slice ops |
 | `lib/Dialect/TritonGPU/Transforms/MaterializeSWSmem.cpp` | V1 hack (legacy, kept for reference) |
 | `python/src/ir.cc` | `create_alloc_shared`, `create_load_shared`, `create_store_shared` pybind |
 | `python/triton/language/core.py` | `shared_buf_type`, `shared_buf`, builtins |
@@ -142,6 +193,13 @@ Full implementation details: [`docs/smem-api/SMEM_GENERALIZED_API.md`](docs/smem
 ---
 
 # V1 Design Doc (Legacy Reference)
+
+The section below is preserved as historical context from the original V1 work.
+Some details there are now outdated for the current branch, notably:
+
+- masked shared stores no longer use IR-level read-modify-write
+- explicit local slice ops now bypass generic membar insertion
+- current initialization work is moving toward compact runtime fill loops
 
 # SW Kernel - Compiler Extensions for Triton (Shared Memory Materialization)
 **Shuochen’s hack for `sw_kernel` v1 - 2025/09/10**
